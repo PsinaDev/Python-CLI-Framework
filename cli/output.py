@@ -5,12 +5,12 @@ Provides colored output, tables, progress bars, and text wrapping
 with automatic terminal capability detection.
 """
 
-import sys
 import os
 import platform
 import re
 import shutil
 import logging
+import sys
 from typing import Dict, List, Optional, TextIO, Any, Callable, Tuple
 from .interfaces import OutputFormatter
 
@@ -135,7 +135,6 @@ def _supports_color() -> bool:
             return True
 
         try:
-            import sys
             if sys.getwindowsversion().major >= 10:
                 return True
         except AttributeError:
@@ -286,9 +285,6 @@ class TerminalOutputFormatter(OutputFormatter):
                     max_col_width: Optional[int] = None) -> None:
         """
         Render formatted table to stdout
-
-        FIX #4: Properly handle ANSI codes in padding calculation
-
         Args:
             headers: Column headers
             rows: Table data rows
@@ -336,12 +332,21 @@ class TerminalOutputFormatter(OutputFormatter):
 
         print(separator)
 
+    def _extract_ansi_codes(self, text: str) -> Tuple[List[str], str]:
+        """
+        Extract ANSI codes from text
+
+        Returns:
+            Tuple of (list of ANSI codes, clean text)
+        """
+        ansi_pattern = re.compile(r'(\033\[[0-9;]+m)')
+        codes = ansi_pattern.findall(text)
+        clean = ansi_pattern.sub('', text)
+        return codes, clean
+
     def _pad_cell(self, text: str, width: int, truncate: bool = True) -> str:
         """
         Pad cell to specified width, handling ANSI codes correctly
-
-        FIX #4: Proper padding that accounts for ANSI escape sequences
-
         Args:
             text: Text to pad (may contain ANSI codes)
             width: Target display width (visible characters)
@@ -350,21 +355,19 @@ class TerminalOutputFormatter(OutputFormatter):
         Returns:
             Padded text with ANSI codes preserved
         """
-        clean_text = self._strip_ansi(text)
+        # Extract ANSI codes and get clean text
+        ansi_codes, clean_text = self._extract_ansi_codes(text)
         clean_len = len(clean_text)
 
         if truncate and clean_len > width:
             # Truncate clean text
             truncated = clean_text[:width - 3] + '...'
 
-            # If original had ANSI styling, try to preserve it on truncated text
-            if text != clean_text and self.use_colors:
-                # Extract first style code from original
-                ansi_pattern = re.compile(r'(\033\[[0-9;]+m)')
-                matches = ansi_pattern.findall(text)
-                if matches:
-                    # Apply first style to truncated text
-                    return matches[0] + truncated + COLORS['reset']
+            # Re-apply ANSI codes if present
+            if ansi_codes and self.use_colors:
+                # Apply all codes found in original, then add reset at end
+                style_prefix = ''.join(ansi_codes)
+                return style_prefix + truncated + COLORS['reset']
 
             return truncated
 
@@ -372,12 +375,17 @@ class TerminalOutputFormatter(OutputFormatter):
             # Need padding
             padding_needed = width - clean_len
 
-            # If text has ANSI codes, we need to add padding AFTER the reset code
-            # or before if there's no reset
-            if text != clean_text:
-                # Text has ANSI codes
-                # Add spaces after the visible text but preserve ANSI structure
-                return text + ' ' * padding_needed
+            # If text has ANSI codes, we need to add padding after the text
+            # but before the reset code if it exists
+            if ansi_codes and self.use_colors:
+                # Check if text ends with reset code
+                if text.endswith(COLORS['reset']):
+                    # Insert padding before reset
+                    text_without_reset = text[:-len(COLORS['reset'])]
+                    return text_without_reset + ' ' * padding_needed + COLORS['reset']
+                else:
+                    # Just add padding at the end
+                    return text + ' ' * padding_needed
             else:
                 # Plain text, just add padding
                 return text + ' ' * padding_needed

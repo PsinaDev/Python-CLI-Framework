@@ -59,8 +59,7 @@ class CommandTrie:
             if current_node.is_end and current_node.command_name:
                 results.append(current_node.command_name)
 
-            for char in sorted(current_node.children.keys()):
-                child_node = current_node.children[char]
+            for char, child_node in current_node.children.items():
                 stack.append((child_node, current_prefix + char))
 
         return sorted(results)
@@ -123,7 +122,9 @@ class CommandMeta:
 
 
 class CommandRegistryImpl(CommandRegistry):
-    """Command registry with aliases, groups, and efficient search"""
+    """
+    Command registry with aliases, groups, and efficient search
+    """
 
     def __init__(self) -> None:
         self._commands: Dict[str, CommandMeta] = {}
@@ -134,27 +135,35 @@ class CommandRegistryImpl(CommandRegistry):
         self._parser_cache_invalidator: Optional[Callable[[str], None]] = None
 
     def register(self, name: str, handler: Callable[..., Any], **metadata: Any) -> None:
-        """Register command with metadata"""
+        """
+        Register command with metadata
+        """
         try:
             if metadata.get('is_group', False):
                 self._groups[name] = copy.deepcopy(metadata)
                 self._logger.debug(f"Registered command group: {name}")
                 return
 
-            cmd_meta = CommandMeta(handler, **metadata)
-
             if name in self._commands:
                 old_meta = self._commands[name]
                 old_aliases = old_meta.get('aliases', [])
+
+                # Remove all old aliases that point to this command
                 for alias in old_aliases:
                     if alias in self._aliases and self._aliases[alias] == name:
                         del self._aliases[alias]
                         self._trie.remove(alias)
+                        self._logger.debug(f"Removed old alias '{alias}' for command '{name}'")
 
+                # Remove the old command itself from trie
+                self._trie.remove(name)
+
+            cmd_meta = CommandMeta(handler, **metadata)
             self._commands[name] = cmd_meta
             self._trie.insert(name)
             self._logger.debug(f"Registered command: {name}")
 
+            # Register new aliases
             aliases: List[str] = metadata.get('aliases', [])
             for alias in aliases:
                 if alias in self._commands:
@@ -163,11 +172,14 @@ class CommandRegistryImpl(CommandRegistry):
                     )
                     continue
 
-                if alias in self._aliases and self._aliases[alias] != name:
-                    self._logger.warning(
-                        f"Alias '{alias}' already points to '{self._aliases[alias]}', overwriting"
-                    )
-                    self._trie.remove(alias)
+                if alias in self._aliases:
+                    old_target = self._aliases[alias]
+                    if old_target != name:
+                        self._logger.warning(
+                            f"Alias '{alias}' previously pointed to '{old_target}', "
+                            f"now reassigning to '{name}'"
+                        )
+                        self._trie.remove(alias)
 
                 self._aliases[alias] = name
                 self._trie.insert(alias)
@@ -240,8 +252,6 @@ VALID_BASIC_TYPES: Set[Type[Any]] = {str, int, float, bool}
 def validate_type(param_type: Any) -> Union[Type[Any], Callable[[str], Any]]:
     """
     Validate and normalize parameter type
-
-    FIX #3: Better handling of Union/Optional types
     """
     # Handle basic types
     if param_type in VALID_BASIC_TYPES:
@@ -286,10 +296,6 @@ def validate_type(param_type: Any) -> Union[Type[Any], Callable[[str], Any]]:
                         f"Please use a single type or provide a custom converter function."
                     )
 
-    # Handle direct container types
-    if origin in (list, dict, tuple):
-        return origin
-
     # Unsupported type - warn and fallback
     logger: logging.Logger = logging.getLogger('cli.command')
     logger.warning(
@@ -315,8 +321,6 @@ class EnhancedArgumentParser(ArgumentParser):
     def parse(self, args: List[str]) -> Dict[str, Any]:
         """
         Parse command-line arguments
-
-        FIX #7: Clean up help flag from result dict
         """
         if not args:
             return {'command': None}
@@ -335,7 +339,6 @@ class EnhancedArgumentParser(ArgumentParser):
             parsed_args: argparse.Namespace = parser.parse_args(remaining_args)
             result.update(vars(parsed_args))
 
-            # FIX #7: Detect help flag and clean it up
             if result.get('help', False):
                 result['show_help'] = True
                 # Remove the 'help' key to avoid leaking it to command kwargs
@@ -392,6 +395,12 @@ class EnhancedArgumentParser(ArgumentParser):
 
         for arg_meta in command_meta.get('arguments', []):
             arg_name: str = arg_meta['name']
+
+            if arg_name in ('help', 'h'):
+                raise ValueError(
+                    f"Argument name '{arg_name}' conflicts with built-in help flag in command '{command}'"
+                )
+
             arg_type: Type[Any] = validate_type(arg_meta.get('type', str))
             arg_help: str = arg_meta.get('help', '')
 
@@ -405,6 +414,13 @@ class EnhancedArgumentParser(ArgumentParser):
         for opt_meta in command_meta.get('options', []):
             opt_name: str = opt_meta['name']
             opt_short: Optional[str] = opt_meta.get('short')
+
+            # ИСПРАВЛЕНИЕ: Проверка коллизии с help
+            if opt_name == 'help' or opt_short == 'h':
+                raise ValueError(
+                    f"Option '--{opt_name}' or '-{opt_short}' conflicts with built-in help flag in command '{command}'"
+                )
+
             opt_type: Type[Any] = validate_type(opt_meta.get('type', str))
             opt_default: Any = opt_meta.get('default')
             opt_is_flag: bool = opt_meta.get('is_flag', False)

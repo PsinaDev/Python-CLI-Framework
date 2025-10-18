@@ -16,7 +16,7 @@ import tempfile
 import platform
 import time
 import copy
-from typing import Any, Dict, Optional, Set
+from typing import Any, Dict, Optional, Set, List
 
 try:
     import jsonschema
@@ -460,7 +460,7 @@ class JsonConfigProvider:
 
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value by hierarchical key"""
-        parts: list[str] = key.split('.')
+        parts: List[str] = key.split('.')
         config: Any = self._config
 
         for part in parts[:-1]:
@@ -475,7 +475,7 @@ class JsonConfigProvider:
 
     def set(self, key: str, value: Any) -> None:
         """Set configuration value by hierarchical key"""
-        parts: list[str] = key.split('.')
+        parts: List[str] = key.split('.')
         config: Dict[str, Any] = self._config
 
         for part in parts[:-1]:

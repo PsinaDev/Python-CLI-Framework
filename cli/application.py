@@ -111,8 +111,6 @@ class MiddlewarePipeline:
     def build(self, final_handler: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:
         """
         Build middleware chain with proper closure handling
-
-        Fixed: Creates explicit wrapper functions to avoid closure issues
         """
         handler = final_handler
 
@@ -141,7 +139,9 @@ class CommandExecutor:
         self._logger = logging.getLogger('cli.executor')
 
     def _suggest_similar_commands(self, command: str, max_suggestions: int = 3) -> List[str]:
-        """Find similar commands using Levenshtein distance"""
+        """
+        Find similar commands using Levenshtein distance
+        """
         def levenshtein_distance(s1: str, s2: str) -> int:
             if len(s1) < len(s2):
                 return levenshtein_distance(s2, s1)
@@ -160,9 +160,11 @@ class CommandExecutor:
 
         all_commands = self.commands.list_commands()
         suggestions = []
+        command_lower = command.lower()
+
         for cmd in all_commands:
-            distance = levenshtein_distance(command.lower(), cmd.lower())
-            if distance <= 3 and len(cmd) >= 3 and cmd[:2] == command[:2]:
+            distance = levenshtein_distance(command_lower, cmd.lower())
+            if distance <= 3 and len(cmd) >= 3 and cmd[:2].lower() == command_lower[:2]:
                 suggestions.append((distance, cmd))
         suggestions.sort(key=lambda x: (x[0], x[1]))
         return [cmd for _, cmd in suggestions[:max_suggestions]]
@@ -194,8 +196,6 @@ class CommandExecutor:
         if not handler:
             print(self.output.format(f"Command '{command}' has no handler", 'error'))
             return 1
-
-        # FIX #1: Catch CommandExecutionError during argument preparation
         try:
             sig: inspect.Signature = inspect.signature(handler)
             positional_args: List[Any] = []
@@ -294,7 +294,7 @@ class CommandExecutor:
             )
             print(self.output.format(error_msg, 'error'))
 
-            if self._logger.level <= logging.DEBUG:
+            if self._logger.isEnabledFor(logging.DEBUG):
                 print(self.output.format("\nTraceback:", 'error'))
                 print(traceback.format_exc())
             raise CommandExecutionError(str(e)) from e
@@ -589,7 +589,9 @@ class CLI:
             logger.addHandler(console_handler)
 
     def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown"""
+        """
+        Setup signal handlers for graceful shutdown
+        """
         if threading.current_thread() is not threading.main_thread():
             self._logger.warning("Signal handlers can only be registered from main thread; skipping")
             return
@@ -604,6 +606,11 @@ class CLI:
                     print("\nShutdown requested. Finishing current operation...", file=sys.stderr)
                 except (OSError, IOError) as e:
                     self._logger.debug(f"Could not print shutdown message: {e}")
+                try:
+                    loop = asyncio.get_running_loop()
+                    loop.call_soon_threadsafe(loop.stop)
+                except RuntimeError:
+                    pass
             else:
                 self._logger.warning(f"Received second {signal_name}, forcing exit")
                 try:

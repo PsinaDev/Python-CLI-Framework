@@ -7,7 +7,8 @@ Provides multi-language support with message caching and parameter formatting.
 import json
 import logging
 import threading
-from typing import Any, Dict, Optional, Set
+import hashlib
+from typing import Any, Dict, Optional, Set, List
 from collections import OrderedDict
 from .interfaces import MessageProvider, ConfigProvider
 
@@ -20,8 +21,6 @@ class MessageError(Exception):
 class ConfigBasedMessageProvider(MessageProvider):
     """
     Configuration-based message provider with LRU caching
-
-    FIX #5: No longer modifies config during initialization
     """
 
     def __init__(self,
@@ -30,8 +29,6 @@ class ConfigBasedMessageProvider(MessageProvider):
                  cache_size: int = 100):
         """
         Initialize message provider
-
-        FIX #5: Constructor no longer has side effects on config.
         Config is only modified during explicit operations like set_language() or add_language().
         """
         if cache_size < 1:
@@ -49,7 +46,7 @@ class ConfigBasedMessageProvider(MessageProvider):
         self._current_language: str = config.get('current_language', self._default_language)
 
         # Build available languages from config
-        config_langs: list = config.get('languages', [])
+        config_langs: List = config.get('languages', [])
         self._available_languages: Set[str] = set(config_langs) if config_langs else {self._default_language}
 
         # Ensure default and current are in available languages (but don't save)
@@ -64,7 +61,7 @@ class ConfigBasedMessageProvider(MessageProvider):
 
     @staticmethod
     def _canonicalize_value(value: Any) -> str:
-        """Convert value to stable string representation (without caching unhashable types)"""
+        """Convert value to stable string representation"""
         if isinstance(value, (str, int, float, bool, type(None))):
             return str(value)
 
@@ -81,20 +78,26 @@ class ConfigBasedMessageProvider(MessageProvider):
                     key: str,
                     default: Optional[str] = None,
                     **kwargs: Any) -> str:
-        """Get localized message with parameter substitution"""
+        """
+        Get localized message with parameter substitution
+        """
+        # Create a deterministic cache key using hash
         cache_key_parts = [self._current_language, key]
-        if kwargs:
-            param_parts = []
-            for k, v in sorted(kwargs.items()):
-                canonical = self._canonicalize_value(v)
-                if len(canonical) > 100:
-                    canonical = canonical[:100] + "..."
-                param_parts.append(f"{k}={canonical}")
 
-            param_str = ','.join(param_parts)
-            if len(param_str) > 500:
-                param_str = param_str[:500] + "..."
-            cache_key_parts.append(param_str)
+        if kwargs:
+            # Sort kwargs to ensure consistent ordering
+            sorted_kwargs = sorted(kwargs.items())
+
+            # Create a stable representation of parameters
+            params_repr = []
+            for k, v in sorted_kwargs:
+                canonical = self._canonicalize_value(v)
+                # Include both key and value in representation
+                params_repr.append(f"{k}:{canonical}")
+            # This ensures different parameter sets always produce different keys
+            params_str = '|'.join(params_repr)
+            params_hash = hashlib.sha256(params_str.encode('utf-8')).hexdigest()[:16]
+            cache_key_parts.append(params_hash)
 
         cache_key = ':'.join(cache_key_parts)
 

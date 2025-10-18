@@ -26,9 +26,8 @@ class CommandMetadataRegistry:
         self._metadata: Dict[int, Dict[str, Any]] = {}
         self._registered: Set[int] = set()
         self._lock = threading.Lock()
-
-        # FIX #6: Track command groups separately to avoid auto-instantiation
         self._group_classes: Dict[str, Type[Any]] = {}
+        self._group_method_ids: Set[int] = set()
 
     def get_metadata(self, func_id: int) -> Optional[Dict[str, Any]]:
         """Get metadata by function id"""
@@ -67,12 +66,23 @@ class CommandMetadataRegistry:
         with self._lock:
             return self._group_classes.copy()
 
+    def mark_as_group_method(self, func_id: int) -> None:
+        """Mark function ID as belonging to a group method"""
+        with self._lock:
+            self._group_method_ids.add(func_id)
+
+    def is_group_method(self, func_id: int) -> bool:
+        """Check if function ID belongs to a group method"""
+        with self._lock:
+            return func_id in self._group_method_ids
+
     def clear(self) -> None:
         """Clear all metadata (useful for testing)"""
         with self._lock:
             self._metadata.clear()
             self._registered.clear()
             self._group_classes.clear()
+            self._group_method_ids.clear()
 
     def get_all_metadata(self) -> Dict[int, Dict[str, Any]]:
         """Get all metadata (deep copy)"""
@@ -86,7 +96,7 @@ _registry = CommandMetadataRegistry()
 
 def is_async_function(func: Callable[..., Any]) -> bool:
     """Check if function is async (coroutine function)"""
-    return inspect.iscoroutinefunction(func) or asyncio.iscoroutinefunction(func)
+    return inspect.iscoroutinefunction(func)
 
 
 def _get_func_id(func: Callable[..., Any]) -> int:
@@ -338,8 +348,6 @@ def group(name: Optional[str] = None,
           help: Optional[str] = None) -> Callable[[Type[Any]], Type[Any]]:
     """
     Decorator to define command group
-
-    FIX #6: Register class without instantiating
     """
 
     def decorator(cls: Type[Any]) -> Type[Any]:
@@ -359,6 +367,8 @@ def group(name: Optional[str] = None,
                     continue
 
                 if hasattr(attr, '__cli_func_id__'):
+                    func_id = attr.__cli_func_id__
+                    _registry.mark_as_group_method(func_id)
                     command_methods.append((attr_name, attr))
             except AttributeError:
                 # Skip attributes that can't be accessed on the class
@@ -385,16 +395,17 @@ def group(name: Optional[str] = None,
 def register_commands(cli_instance: Any) -> int:
     """
     Register all decorated commands with CLI instance
-
-    FIX #6: Only instantiate group classes when explicitly registered,
-    not by scanning sys.modules
     """
     registered_count: int = 0
     all_metadata = _registry.get_all_metadata()
 
-    # Register standalone commands
+    # Register standalone commands (excluding group methods)
     for func_id, metadata in all_metadata.items():
         if _registry.is_registered(func_id):
+            continue
+
+        # Skip if this is a group method
+        if _registry.is_group_method(func_id):
             continue
 
         try:
@@ -422,8 +433,7 @@ def register_commands(cli_instance: Any) -> int:
             import traceback
             _logger.error(traceback.format_exc())
 
-    # FIX #6: Process only explicitly registered group classes
-    # No more scanning sys.modules and instantiating all classes
+    # Process explicitly registered group classes
     group_classes = _registry.get_group_classes()
 
     for group_name, group_class in group_classes.items():

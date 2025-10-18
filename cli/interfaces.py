@@ -133,13 +133,15 @@ class OutputFormatter(ABC):
         pass
 
     @abstractmethod
-    def render_table(self, headers: List[str], rows: List[List[str]]) -> None:
+    def render_table(self, headers: List[str], rows: List[List[str]],
+                     max_col_width: Optional[int] = None) -> None:
         """
         Render a formatted table to output
 
         Args:
             headers: Table column headers
             rows: Table data rows
+            max_col_width: Maximum column width (None = auto-calculate)
         """
         pass
 
