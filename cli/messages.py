@@ -19,18 +19,13 @@ class MessageError(Exception):
 
 
 class ConfigBasedMessageProvider(MessageProvider):
-    """
-    Configuration-based message provider with LRU caching
-    """
+    """Configuration-based message provider with LRU caching"""
 
     def __init__(self,
                  config: ConfigProvider,
                  default_language: str = 'en',
                  cache_size: int = 100):
-        """
-        Initialize message provider
-        Config is only modified during explicit operations like set_language() or add_language().
-        """
+        """Initialize message provider"""
         if cache_size < 1:
             raise ValueError(f"cache_size must be >= 1, got {cache_size}")
 
@@ -41,15 +36,12 @@ class ConfigBasedMessageProvider(MessageProvider):
         self._cache_lock = threading.Lock()
         self._config_lock = threading.Lock()
 
-        # Read from config without modifying it
         self._default_language: str = config.get('default_language', default_language)
         self._current_language: str = config.get('current_language', self._default_language)
 
-        # Build available languages from config
         config_langs: List = config.get('languages', [])
         self._available_languages: Set[str] = set(config_langs) if config_langs else {self._default_language}
 
-        # Ensure default and current are in available languages (but don't save)
         self._available_languages.add(self._default_language)
         self._available_languages.add(self._current_language)
 
@@ -78,23 +70,19 @@ class ConfigBasedMessageProvider(MessageProvider):
                     key: str,
                     default: Optional[str] = None,
                     **kwargs: Any) -> str:
-        """
-        Get localized message with parameter substitution
-        """
-        # Create a deterministic cache key using hash
+        """Get localized message with parameter substitution"""
         cache_key_parts = [self._current_language, key]
 
-        if kwargs:
-            # Sort kwargs to ensure consistent ordering
-            sorted_kwargs = sorted(kwargs.items())
+        if default is not None:
+            default_hash = hashlib.sha256(default.encode('utf-8')).hexdigest()[:8]
+            cache_key_parts.append(default_hash)
 
-            # Create a stable representation of parameters
+        if kwargs:
+            sorted_kwargs = sorted(kwargs.items())
             params_repr = []
             for k, v in sorted_kwargs:
                 canonical = self._canonicalize_value(v)
-                # Include both key and value in representation
                 params_repr.append(f"{k}:{canonical}")
-            # This ensures different parameter sets always produce different keys
             params_str = '|'.join(params_repr)
             params_hash = hashlib.sha256(params_str.encode('utf-8')).hexdigest()[:16]
             cache_key_parts.append(params_hash)
@@ -150,11 +138,7 @@ class ConfigBasedMessageProvider(MessageProvider):
         return message
 
     def set_language(self, language: str) -> None:
-        """
-        Set current language for messages
-
-        This method DOES modify config (explicitly)
-        """
+        """Set current language for messages"""
         with self._config_lock:
             if language not in self._available_languages:
                 available_str = ', '.join(sorted(self._available_languages))
@@ -187,11 +171,7 @@ class ConfigBasedMessageProvider(MessageProvider):
     def add_language(self,
                      language: str,
                      messages: Dict[str, str]) -> None:
-        """
-        Add new language with messages
-
-        This method DOES modify config (explicitly)
-        """
+        """Add new language with messages"""
         with self._config_lock:
             try:
                 existing_messages: Dict[str, str] = self._config.get(
@@ -203,8 +183,6 @@ class ConfigBasedMessageProvider(MessageProvider):
                 self._config.set(f'messages.{language}', existing_messages)
 
                 self._available_languages.add(language)
-
-                # Update languages list in config
                 self._config.set('languages', sorted(self._available_languages))
 
                 self._config.save()
@@ -220,11 +198,13 @@ class ConfigBasedMessageProvider(MessageProvider):
                 self._logger.error(f"Error adding language '{language}': {e}")
                 raise MessageError(f"Failed to add language '{language}': {e}")
 
-    def remove_language(self, language: str) -> None:
+    def remove_language(self, language: str, purge: bool = False) -> None:
         """
-        Remove language and its messages
+        Remove language and optionally purge its messages
 
-        This method DOES modify config (explicitly)
+        Args:
+            language: Language code to remove
+            purge: If True, delete messages from config; if False, only remove from available list
         """
         with self._config_lock:
             if language == self._default_language:
@@ -247,16 +227,21 @@ class ConfigBasedMessageProvider(MessageProvider):
                 self._available_languages.discard(language)
                 self._config.set('languages', sorted(self._available_languages))
 
-                # Note: We don't delete the messages.{language} key from config
-                # to preserve data in case user wants to re-add the language
-                # If you want to delete: self._config.set(f'messages.{language}', None)
+                if purge:
+                    all_config = self._config.get_all()
+                    if 'messages' in all_config and language in all_config['messages']:
+                        messages_dict = dict(all_config['messages'])
+                        del messages_dict[language]
+                        self._config.set('messages', messages_dict)
+                        self._logger.info(f"Purged all messages for language '{language}'")
 
                 self._config.save()
 
                 with self._cache_lock:
                     self._message_cache.clear()
 
-                self._logger.info(f"Removed language '{language}' from available languages")
+                action = "removed and purged" if purge else "removed from available languages"
+                self._logger.info(f"Language '{language}' {action}")
 
             except Exception as e:
                 self._logger.error(f"Error removing language '{language}': {e}")

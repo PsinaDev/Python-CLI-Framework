@@ -13,6 +13,7 @@
 - [Advanced Features](#advanced-features)
   - [Async Commands](#async-commands)
   - [Middleware](#middleware)
+  - [Lifecycle Hooks](#lifecycle-hooks)
   - [CLI Context](#cli-context)
   - [CLI Auto-generation](#cli-auto-generation)
   - [Cleanup Callbacks](#cleanup-callbacks)
@@ -36,13 +37,13 @@
 - **Multi-language support** through message system
 - **Safe configuration** with file locking
 - **CLI auto-generation** from classes and functions
-- **Middleware** for extending functionality
+- **Middleware & Hooks** for extending functionality
 - **CLI Context** for sharing data between middleware and commands
 - **Cross-platform** (Windows, Linux, macOS)
 
 ### Requirements
 
-- Python 3.7+
+- **Python 3.8+** (uses `typing.get_origin`/`get_args` from standard library)
 - Optional: `jsonschema` (for configuration validation)
 
 ---
@@ -64,9 +65,8 @@ pip install jsonschema  # optional
 Create `app.py`:
 
 ```python
-from cli import CLI, echo
+from cliframework import CLI, echo
 
-# Create CLI instance
 cli = CLI(name='myapp')
 
 @cli.command()
@@ -108,15 +108,27 @@ A command consists of:
 - **Help** — command and parameter descriptions
 - **Examples** — usage examples
 
+### Reserved Names
+
+The following names are reserved and cannot be used for arguments, options, or commands:
+- `help`, `h` — reserved for help flag
+- `_cli_help`, `_cli_show_help` — internal help handling
+
+Using reserved names will raise a clear error during command registration.
+
 ### Command Lifecycle
 
 1. **Parsing** — CLI parses command-line arguments
 2. **Validation** — type checking and required parameters
-3. **Context Setup** — CLI context is populated
-4. **Middleware Chain** — execution of middleware in registration order
-5. **Execution** — command handler invocation
-6. **Result Handling** — return exit code
-7. **Cleanup** — cleanup callbacks execution
+3. **Hooks: Before Parse** — modify arguments before parsing
+4. **Hooks: After Parse** — modify parsed results
+5. **Context Setup** — CLI context is populated
+6. **Hooks: Before Execute** — pre-execution logic
+7. **Middleware Chain** — execution of middleware in registration order
+8. **Execution** — command handler invocation
+9. **Hooks: After Execute** — post-execution logic
+10. **Result Handling** — return exit code
+11. **Cleanup** — cleanup callbacks execution
 
 ---
 
@@ -145,14 +157,20 @@ Add a positional argument:
 @cli.command()
 @cli.argument('filename', help='Path to file', type=str)
 @cli.argument('count', help='Number of lines', type=int)
-def process(filename, count):
+@cli.argument('output', help='Output file', type=str, optional=True)
+def process(filename, count, output=None):
     echo(f'Processing {filename}, lines: {count}')
+    if output:
+        echo(f'Output to: {output}')
 ```
 
 **Parameters:**
 - `name` (str) — argument name
 - `help` (str, optional) — argument description
 - `type` (Type, optional) — argument type (default `str`)
+- `optional` (bool, optional) — whether argument is optional (default `False`)
+
+**Important:** Only one optional positional argument is allowed, and it must be the last argument.
 
 **Supported types:** `str`, `int`, `float`, `bool`, `list`, `dict`, `tuple`
 
@@ -177,6 +195,8 @@ def process(verbose, output, count):
 - `type` (Type, optional) — option type (default `str`)
 - `default` (Any, optional) — default value
 - `is_flag` (bool, optional) — boolean flag (True/False)
+
+**Flags with default=True:** Use `--no-<name>` to disable (e.g., `--no-verbose`)
 
 ### @example
 
@@ -221,30 +241,42 @@ class Database:
 
 ## Formatted Output
 
-### Colored Text
+### The echo() Function
 
 The `echo()` function outputs styled text:
 
 ```python
-from cli import echo
+from cliframework import echo
+import sys
+
+# Simple output
+echo('Hello, world!')
 
 # Predefined styles
-echo('Success!', 'success')    # Green
-echo('Warning!', 'warning')     # Yellow
-echo('Error!', 'error')         # Red
-echo('Information', 'info')     # Blue
-echo('Header', 'header')        # Bold white
-echo('Debug', 'debug')          # Gray
+echo('Success!', 'success')      # Green
+echo('Warning!', 'warning')      # Yellow
+echo('Error!', 'error')          # Red
+echo('Info', 'info')             # Blue
+echo('Header', 'header')         # Bold white
+echo('Debug', 'debug')           # Gray
+
+# Output to stderr
+echo('Error occurred!', 'error', file=sys.stderr)
+
+# Custom formatter
+from cliframework import TerminalOutputFormatter
+formatter = TerminalOutputFormatter(use_colors=True)
+echo('Custom formatting', 'success', formatter=formatter)
 ```
 
 **Available styles:** `success`, `error`, `warning`, `info`, `header`, `debug`, `emphasis`, `code`, `highlight`
 
-### Custom Formatting
+### Custom Formatting with style()
 
-The `style()` function applies arbitrary formatting:
+The `style()` function applies formatting and returns a styled string:
 
 ```python
-from cli import style
+from cliframework import style
 
 # Foreground colors
 text = style('Red text', fg='red')
@@ -261,14 +293,15 @@ text = style('Bold red', fg='red', bold=True)
 print(text)
 ```
 
-**Available colors:** `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `bright_*` (variants for each color)
+**Available colors:** `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `bright_*` (variants)
 
 ### Tables
 
 The `table()` function outputs formatted tables:
 
 ```python
-from cli import table
+from cliframework import table
+import sys
 
 headers = ['Name', 'Age', 'City']
 rows = [
@@ -277,7 +310,14 @@ rows = [
     ['John', '25', 'Novosibirsk']
 ]
 
+# Output to stdout (default)
 table(headers, rows)
+
+# Output to stderr
+table(headers, rows, file=sys.stderr)
+
+# With custom column width
+table(headers, rows, max_col_width=20)
 ```
 
 ### Progress Bars
@@ -285,24 +325,42 @@ table(headers, rows)
 The `progress_bar()` function creates an interactive progress bar:
 
 ```python
-from cli import progress_bar
+from cliframework import progress_bar
 import time
+import sys
 
 total = 100
+
+# Basic usage
+update = progress_bar(total)
+for i in range(total + 1):
+    update(i)
+    time.sleep(0.02)
+
+# Advanced usage
 update = progress_bar(
     total,
-    prefix='Loading:',
-    suffix='complete',
-    char='█',
-    empty_char='░',
-    show_percent=True,
-    show_count=True
+    width=50,                    # Bar width
+    char='█',                    # Fill character
+    empty_char='·',              # Empty character
+    show_percent=True,           # Show percentage
+    show_count=True,             # Show count (current/total)
+    prefix='Loading:',           # Text before bar
+    suffix='complete',           # Text after bar
+    color_low='yellow',          # Color for 0-33%
+    color_mid='blue',            # Color for 33-66%
+    color_high='green',          # Color for 66-100%
+    brackets=('[', ']'),         # Bracket characters
+    file=sys.stdout,             # Output stream
+    force_inline=None            # Force inline updates (None=auto-detect)
 )
 
 for i in range(total + 1):
     update(i)
     time.sleep(0.02)
 ```
+
+**Output stream support:** All output functions (`echo`, `table`, `progress_bar`) support custom output streams via the `file` parameter.
 
 ---
 
@@ -313,11 +371,11 @@ CLI Framework provides safe configuration storage with automatic file locking.
 ### Working with Configuration
 
 ```python
-from cli import CLI
+from cliframework import CLI
 
 cli = CLI(name='myapp')
 
-# Save values
+# Save values using hierarchical keys
 cli.config.set('app.name', 'My Application')
 cli.config.set('app.version', '1.0.0')
 cli.config.set('database.host', 'localhost')
@@ -330,12 +388,30 @@ db_host = cli.config.get('database.host', 'localhost')
 
 # Get entire configuration
 config_dict = cli.config.get_all()
+```
 
-# Update from dictionary
+### Updating Configuration
+
+**Method 1: Using set() for hierarchical keys (recommended)**
+```python
+cli.config.set('app.theme', 'dark')
+cli.config.set('app.language', 'en')
+cli.config.save()
+```
+
+**Method 2: Using update() with nested dictionaries**
+```python
+# Correct: nested structure
 cli.config.update({
-    'app.theme': 'dark',
-    'app.language': 'en'
+    'app': {
+        'theme': 'dark',
+        'language': 'en'
+    }
 })
+cli.config.save()
+
+# INCORRECT: flat keys with dots
+# cli.config.update({'app.theme': 'dark'})  # Creates literal key 'app.theme'
 ```
 
 ### Hierarchical Access
@@ -351,6 +427,8 @@ cli.config.set('server.database.credentials.password', 'secret')
 username = cli.config.get('server.database.credentials.username')
 ```
 
+**Note:** Sensitive keys (containing 'password', 'token', 'secret', etc.) are automatically masked in logs.
+
 ---
 
 ## Localization
@@ -360,7 +438,7 @@ CLI Framework supports multi-language applications through the message system.
 ### Using Messages
 
 ```python
-from cli import CLI, echo
+from cliframework import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -370,11 +448,13 @@ def greet(name):
     """Greet a user"""
     message = cli.messages.get_message(
         'greeting',
-        'Hello, {name}!',
+        default='Hello, {name}!',
         name=name
     )
     echo(message, 'success')
 ```
+
+**Note:** The message cache now properly handles the `default` parameter, ensuring different defaults for the same key don't return cached incorrect values.
 
 ### Adding Languages
 
@@ -389,6 +469,12 @@ cli.messages.add_language('ru', ru_messages)
 
 # Switch language
 cli.messages.set_language('ru')
+
+# Remove language (keeps messages by default)
+cli.messages.remove_language('ru', purge=False)
+
+# Remove language and delete messages
+cli.messages.remove_language('ru', purge=True)
 ```
 
 ---
@@ -401,7 +487,7 @@ CLI Framework fully supports async commands:
 
 ```python
 import asyncio
-from cli import CLI, echo
+from cliframework import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -420,12 +506,12 @@ if __name__ == '__main__':
 
 ### Middleware
 
-Middleware allows adding functionality to command execution.
+Middleware allows adding functionality to command execution. All middleware must be async functions.
 
 #### Basic Middleware
 
 ```python
-from cli import CLI, echo
+from cliframework import CLI, echo
 import time
 
 cli = CLI(name='myapp')
@@ -445,7 +531,7 @@ async def logging_middleware(next_handler):
     echo('← Command completed', 'debug')
     return result
 
-# Register middleware
+# Register middleware (executed in registration order)
 cli.use(logging_middleware)
 cli.use(timing_middleware)
 
@@ -459,30 +545,59 @@ if __name__ == '__main__':
     cli.run()
 ```
 
+**Important:** Only async middleware is supported. Synchronous middleware cannot properly implement the around-pattern required by the framework.
+
 #### Built-in Logging Middleware
 
 CLI Framework provides built-in debugging middleware:
 
 **Method 1: Enable at initialization**
 ```python
-cli = CLI(name='myapp', auto_logging_middleware=True)
+import logging
+cli = CLI(name='myapp', auto_logging_middleware=True, log_level=logging.DEBUG)
 ```
 
 **Method 2: Add manually**
 ```python
-cli = CLI(name='myapp')
+import logging
+cli = CLI(name='myapp', log_level=logging.DEBUG)
 cli.use_logging_middleware()
 ```
 
-This middleware logs:
+This middleware logs (at DEBUG level):
 - Command name and arguments before execution
-- Execution result or errors
-- Execution at DEBUG level
+- Execution result after completion
+- Execution errors
 
-Example output:
-```
-[Middleware] Executing command 'greet' with args: {'name': 'World', 'greeting': 'Hello'}
-[Middleware] Command 'greet' completed successfully with result: 0
+### Lifecycle Hooks
+
+Hooks allow extending CLI behavior at specific lifecycle points. All hook methods are async.
+
+```python
+from cliframework import CLI, echo
+from cliframework.interfaces import Hook
+
+cli = CLI(name='myapp')
+
+class LoggingHook(Hook):
+    async def on_before_parse(self, args):
+        echo(f'Parsing: {args}', 'debug')
+        return args
+    
+    async def on_after_parse(self, parsed):
+        echo(f'Parsed: {parsed}', 'debug')
+        return parsed
+    
+    async def on_before_execute(self, command, kwargs):
+        echo(f'Executing: {command}({kwargs})', 'debug')
+    
+    async def on_after_execute(self, command, result, exit_code):
+        echo(f'Completed: {command} -> {exit_code}', 'debug')
+    
+    async def on_error(self, command, error):
+        echo(f'Error in {command}: {error}', 'error')
+
+cli.add_hook(LoggingHook())
 ```
 
 ### CLI Context
@@ -508,8 +623,6 @@ cli.use(context_aware_middleware)
 ```
 
 #### Setting Custom Context Data
-
-You can store custom data in the context for use across middleware chain:
 
 ```python
 async def auth_middleware(next_handler):
@@ -546,101 +659,14 @@ The CLI context contains:
 - `cli_instance` (CLI) — reference to CLI instance
 - Any custom data set via `set_context()`
 
-#### Complete Example with Context
-
-```python
-from cli import CLI, echo
-import time
-
-cli = CLI(name='myapp')
-
-# Authentication middleware
-async def auth_middleware(next_handler):
-    # Simulate authentication
-    cli.set_context(
-        authenticated=True,
-        user_id=123,
-        username='john_doe',
-        permissions=['read', 'write']
-    )
-    
-    echo('✓ User authenticated', 'success')
-    result = await next_handler()
-    return result
-
-# Authorization middleware
-async def authz_middleware(next_handler):
-    ctx = cli.get_context()
-    
-    if not ctx.get('authenticated', False):
-        echo('✗ Not authenticated', 'error')
-        return 1
-    
-    command = ctx.get('command')
-    permissions = ctx.get('permissions', [])
-    
-    # Check permissions
-    if command == 'delete' and 'write' not in permissions:
-        echo('✗ Insufficient permissions', 'error')
-        return 1
-    
-    result = await next_handler()
-    return result
-
-# Audit logging middleware
-async def audit_middleware(next_handler):
-    ctx = cli.get_context()
-    
-    username = ctx.get('username', 'anonymous')
-    command = ctx.get('command', 'unknown')
-    args = ctx.get('args', {})
-    
-    start = time.time()
-    
-    echo(f'[AUDIT] {username} -> {command}({args})', 'debug')
-    
-    result = await next_handler()
-    elapsed = time.time() - start
-    
-    echo(f'[AUDIT] {username} <- {command} (exit={result}, time={elapsed:.2f}s)', 'debug')
-    
-    return result
-
-# Register middleware
-cli.use(auth_middleware)
-cli.use(authz_middleware)
-cli.use(audit_middleware)
-
-@cli.command()
-@cli.argument('filename', help='File to read')
-def read(filename):
-    """Read file"""
-    ctx = cli.get_context()
-    username = ctx.get('username', 'unknown')
-    
-    echo(f'{username} is reading {filename}', 'info')
-    return 0
-
-@cli.command()
-@cli.argument('filename', help='File to delete')
-def delete(filename):
-    """Delete file"""
-    ctx = cli.get_context()
-    username = ctx.get('username', 'unknown')
-    
-    echo(f'{username} is deleting {filename}', 'warning')
-    return 0
-
-if __name__ == '__main__':
-    cli.run()
-```
+**Note:** Context is only available during command execution (in middleware). It's not directly available in command handlers. To access context data in commands, store it in module-level or class variables from middleware.
 
 ### CLI Auto-generation
 
 Create CLI automatically from existing classes:
 
 ```python
-from cli import CLI
+from cliframework import CLI, echo
 
 cli = CLI(name='filetools')
 
@@ -651,22 +677,24 @@ class FileManager:
         for item in os.listdir(path):
             if not show_hidden and item.startswith('.'):
                 continue
-            print(item)
+            echo(item)
     
     def info(self, filepath):
         """Show file information"""
         import os
         stats = os.stat(filepath)
-        print(f'Size: {stats.st_size} bytes')
-        print(f'Modified: {stats.st_mtime}')
+        echo(f'Size: {stats.st_size} bytes')
+        echo(f'Modified: {stats.st_mtime}')
 
 # Automatic command generation
 cli.generate_from(FileManager)
 
-# Commands will be available as:
-# filemanager.list
-# filemanager.info
+# Commands available as:
+# filemanager.list --path=/tmp --show-hidden
+# filemanager.info /path/to/file
 ```
+
+**Safe mode (default):** Only public methods (not starting with `_`) are exposed.
 
 ### Cleanup Callbacks
 
@@ -677,26 +705,26 @@ cli = CLI(name='myapp')
 
 # Synchronous cleanup
 def cleanup():
-    print('Cleaning up resources...')
+    echo('Cleaning up resources...', 'info')
     # Close connections, save state, etc.
 
 cli.add_cleanup_callback(cleanup)
 
 # Asynchronous cleanup
 async def async_cleanup():
-    print('Async cleanup...')
+    echo('Async cleanup...', 'info')
     await asyncio.sleep(0.1)
     # Async cleanup tasks
 
 cli.add_cleanup_callback(async_cleanup)
-
-# Cleanup callbacks are called on:
-# - Normal exit (exit command)
-# - Ctrl+C (graceful shutdown)
-# - Exception during execution
 ```
 
-**Note:** Async cleanup callbacks are only executed during normal async shutdown. They are skipped in signal handlers for safety.
+**Cleanup callbacks are called on:**
+- Normal exit (exit command)
+- Ctrl+C (graceful shutdown)
+- Exception during execution
+
+**Note:** Emergency cleanup (on force exit) only executes synchronous callbacks.
 
 ### Interactive Mode (REPL)
 
@@ -782,7 +810,7 @@ CLI(
 
 **Parameters:**
 - `name` — application name
-- `config_path` — path to configuration file
+- `config_path` — path to configuration file (default: `~/.config/{name}/{name}.json`)
 - `config_provider` — custom configuration provider
 - `config_schema` — JSON schema for validation
 - `message_provider` — custom message provider
@@ -795,14 +823,15 @@ CLI(
 **Methods:**
 
 - `command(name, help, aliases)` — command decorator
-- `argument(name, help, type)` — argument decorator
+- `argument(name, help, type, optional)` — argument decorator
 - `option(name, short, help, type, default, is_flag)` — option decorator
 - `example(example_text)` — example decorator
 - `group(name, help)` — group decorator
 - `generate_from(obj, safe_mode=True)` — generate CLI from object
 - `register_all_commands()` — register all decorated commands
-- `use(middleware)` — add middleware
+- `use(middleware)` — add async middleware
 - `use_logging_middleware()` — add built-in logging middleware
+- `add_hook(hook)` — add lifecycle hook
 - `get_context() -> Dict[str, Any]` — get current CLI context
 - `set_context(**kwargs)` — set context variables
 - `add_cleanup_callback(callback)` — register cleanup callback
@@ -813,11 +842,11 @@ CLI(
 
 **Attributes:**
 
-- `config` — configuration provider
-- `messages` — message provider
-- `output` — output formatter
-- `commands` — command registry
-- `parser` — argument parser
+- `config` — configuration provider (implements ConfigProvider)
+- `messages` — message provider (implements MessageProvider)
+- `output` — output formatter (implements OutputFormatter)
+- `commands` — command registry (implements CommandRegistry)
+- `parser` — argument parser (implements ArgumentParser)
 - `exit_code` — last command exit code
 
 ### Output Functions
@@ -825,10 +854,21 @@ CLI(
 #### echo()
 
 ```python
-echo(text: str, style: Optional[str] = None, file: TextIO = sys.stdout) -> None
+echo(
+    text: str,
+    style: Optional[str] = None,
+    file: TextIO = sys.stdout,
+    formatter: Optional[TerminalOutputFormatter] = None
+) -> None
 ```
 
-Output styled text.
+Output styled text to stream.
+
+**Parameters:**
+- `text` — text to print
+- `style` — style name (success, error, warning, info, header, debug, etc.)
+- `file` — output stream (default: stdout)
+- `formatter` — custom formatter instance (uses cached default if None)
 
 #### style()
 
@@ -839,27 +879,77 @@ style(
     bg: Optional[str] = None,
     bold: bool = False,
     underline: bool = False,
-    blink: bool = False
+    blink: bool = False,
+    formatter: Optional[TerminalOutputFormatter] = None
 ) -> str
 ```
 
-Apply styles to text.
+Apply styles to text and return styled string.
 
 #### table()
 
 ```python
-table(headers: List[str], rows: List[List[str]]) -> None
+table(
+    headers: List[str],
+    rows: List[List[str]],
+    max_col_width: Optional[int] = None,
+    file: TextIO = sys.stdout,
+    formatter: Optional[TerminalOutputFormatter] = None
+) -> None
 ```
 
-Output table.
+Output formatted table to stream.
+
+**Parameters:**
+- `headers` — column headers
+- `rows` — table data rows
+- `max_col_width` — maximum column width (None = auto-calculate)
+- `file` — output stream (default: stdout)
+- `formatter` — custom formatter instance
 
 #### progress_bar()
 
 ```python
-progress_bar(total: int, **kwargs) -> Callable[[int], None]
+progress_bar(
+    total: int,
+    width: Optional[int] = None,
+    char: str = '█',
+    empty_char: str = '·',
+    show_percent: bool = True,
+    show_count: bool = True,
+    prefix: str = '',
+    suffix: str = '',
+    color_low: str = 'yellow',
+    color_mid: str = 'blue',
+    color_high: str = 'green',
+    color_threshold_low: float = 0.33,
+    color_threshold_high: float = 0.66,
+    brackets: tuple = ('[', ']'),
+    file: TextIO = sys.stdout,
+    force_inline: Optional[bool] = None,
+    formatter: Optional[TerminalOutputFormatter] = None
+) -> Callable[[int], None]
 ```
 
-Create progress bar. Returns update function.
+Create progress bar. Returns update function that takes current value.
+
+**Parameters:**
+- `total` — total number of iterations
+- `width` — bar width (None = auto-calculate)
+- `char` — fill character
+- `empty_char` — empty character
+- `show_percent` — show percentage
+- `show_count` — show count (current/total)
+- `prefix` — text before bar
+- `suffix` — text after bar
+- `color_low`, `color_mid`, `color_high` — colors for progress stages
+- `color_threshold_low`, `color_threshold_high` — thresholds for color changes
+- `brackets` — tuple of (left, right) bracket characters
+- `file` — output stream (default: stdout)
+- `force_inline` — force inline updates (None = auto-detect)
+- `formatter` — custom formatter instance
+
+**Returns:** Function that takes current progress value (0 to total)
 
 ---
 
@@ -868,10 +958,11 @@ Create progress bar. Returns update function.
 ### Complete Example: Task Manager
 
 ```python
-from cli import CLI, echo, table, progress_bar
+from cliframework import CLI, echo, table, progress_bar
 import time
+import logging
 
-cli = CLI(name='tasks', auto_logging_middleware=True)
+cli = CLI(name='tasks', auto_logging_middleware=True, log_level=logging.INFO)
 
 # Storage
 tasks = []
@@ -978,7 +1069,7 @@ if __name__ == '__main__':
 
 **Solution:**
 ```python
-from cli import TerminalOutputFormatter
+from cliframework import TerminalOutputFormatter, CLI
 
 cli = CLI(
     name='myapp',
@@ -995,21 +1086,67 @@ cli = CLI(
 pip install pyreadline3
 ```
 
+### Python Version Error
+
+**Problem:** ImportError or RuntimeError about Python version.
+
+**Solution:** CLI Framework requires Python 3.8+. Check and upgrade:
+```bash
+python --version  # Should be 3.8 or higher
+```
+
+### Reserved Name Conflict
+
+**Problem:** Error about reserved name when defining argument/option.
+
+**Solution:** Avoid using reserved names: `help`, `h`, `_cli_help`, `_cli_show_help`. Choose different names:
+```python
+# Wrong
+@cli.argument('help', help='Help text')
+
+# Right
+@cli.argument('help_text', help='Help text')
+```
+
 ### Context Not Available in Command
 
 **Problem:** `cli.get_context()` returns empty dict in command handler.
 
-**Solution:** Context is only available during command execution through middleware. Access it in middleware or store context data in your own storage if needed in commands:
+**Solution:** Context is only available during command execution through middleware. Store context data in module/class variables if needed in commands:
 
 ```python
+current_context = {}
+
 async def store_context_middleware(next_handler):
     ctx = cli.get_context()
-    # Store in global or class variable for access in commands
-    global current_user
-    current_user = ctx.get('username')
-    
+    current_context.update(ctx)
     result = await next_handler()
     return result
+
+cli.use(store_context_middleware)
+
+@cli.command()
+def my_command():
+    username = current_context.get('username', 'unknown')
+    echo(f'Hello, {username}!')
+```
+
+### Output Not Redirecting
+
+**Problem:** Output goes to stdout even when redirecting to file.
+
+**Solution:** Use the `file` parameter in output functions:
+```python
+import sys
+
+# Redirect to stderr
+echo('Error message', 'error', file=sys.stderr)
+table(headers, rows, file=sys.stderr)
+
+# Redirect to file
+with open('output.txt', 'w') as f:
+    echo('Logging to file', file=f)
+    table(headers, rows, file=f)
 ```
 
 ---
@@ -1027,12 +1164,15 @@ CLI Framework uses modular architecture with clear interfaces for easy customiza
 - **MessageProvider** — localization with message caching
 - **OutputFormatter** — formatted terminal output
 - **Middleware** — extensible command processing chain
+- **Hook** — lifecycle event system
+
+All components implement abstract interfaces defined in `interfaces.py`, allowing easy replacement with custom implementations.
 
 ---
 
-## License
+## Version
 
-CLI Framework is developed by **Psinadev**. Version 1.0.0.
+CLI Framework **v1.1.0** by **Psinadev**
 
 ---
 

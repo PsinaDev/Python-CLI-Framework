@@ -1,12 +1,12 @@
 """
 Core interfaces for the CLI Framework
 
-This module defines abstract base classes that establish contracts
-for various components of the framework.
+Defines abstract base classes that establish contracts for framework components.
 """
 
 from abc import ABC, abstractmethod
-from typing import Any, Dict, List, Optional, Callable, TypeVar, Generic, Set, Awaitable
+from typing import Any, Dict, List, Optional, Callable, TypeVar, Generic, Awaitable, TextIO
+import sys
 
 T = TypeVar('T')
 
@@ -15,8 +15,8 @@ class ConfigProvider(ABC):
     """
     Abstract interface for configuration management
 
-    Implementations should handle persistent storage and retrieval
-    of configuration data with hierarchical key support.
+    Implementations handle persistent storage and retrieval of configuration data
+    with hierarchical key support.
     """
 
     @abstractmethod
@@ -133,15 +133,19 @@ class OutputFormatter(ABC):
         pass
 
     @abstractmethod
-    def render_table(self, headers: List[str], rows: List[List[str]],
-                     max_col_width: Optional[int] = None) -> None:
+    def render_table(self,
+                    headers: List[str],
+                    rows: List[List[str]],
+                    max_col_width: Optional[int] = None,
+                    file: TextIO = sys.stdout) -> None:
         """
-        Render a formatted table to output
+        Render a formatted table to output stream
 
         Args:
             headers: Table column headers
             rows: Table data rows
             max_col_width: Maximum column width (None = auto-calculate)
+            file: Output stream (default: stdout)
         """
         pass
 
@@ -152,7 +156,7 @@ class OutputFormatter(ABC):
 
         Args:
             total: Total number of iterations
-            **kwargs: Additional progress bar options
+            **kwargs: Additional progress bar options (width, char, file, etc.)
 
         Returns:
             Function to update progress bar with current value
@@ -197,7 +201,13 @@ class CommandRegistry(ABC):
         Args:
             name: Command name
             handler: Command handler function
-            **metadata: Command metadata (arguments, options, help, etc.)
+            **metadata: Command metadata including:
+                - help (str): Command description
+                - arguments (List[Dict]): Positional argument definitions
+                - options (List[Dict]): Option definitions
+                - aliases (List[str]): Alternative command names
+                - examples (List[str]): Usage examples
+                - is_async (bool): Whether handler is async
         """
         pass
 
@@ -279,7 +289,7 @@ class Middleware(ABC):
     """
     Abstract interface for command execution middleware
 
-    Middleware can wrap command execution to add cross-cutting concerns
+    Middleware wraps command execution to add cross-cutting concerns
     like logging, timing, authentication, etc.
     """
 
@@ -301,7 +311,7 @@ class Hook(ABC):
     """
     Abstract interface for lifecycle hooks
 
-    Hooks allow extending CLI behavior at specific lifecycle points.
+    Hooks extend CLI behavior at specific lifecycle points.
     """
 
     @abstractmethod

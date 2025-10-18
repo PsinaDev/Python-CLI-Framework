@@ -5,12 +5,13 @@ Provides colored output, tables, progress bars, and text wrapping
 with automatic terminal capability detection.
 """
 
+import sys
 import os
 import platform
 import re
 import shutil
 import logging
-import sys
+import threading
 from typing import Dict, List, Optional, TextIO, Any, Callable, Tuple
 from .interfaces import OutputFormatter
 
@@ -18,6 +19,14 @@ from .interfaces import OutputFormatter
 class OutputError(Exception):
     """Output formatting error"""
     pass
+
+
+if platform.system() == 'Windows':
+    try:
+        import colorama
+        colorama.just_fix_windows_console()
+    except (ImportError, Exception):
+        pass
 
 
 COLORS: Dict[str, str] = {
@@ -61,13 +70,8 @@ STYLES: Dict[str, str] = {
 }
 
 
-def _enable_windows_vt_mode() -> bool:
-    """
-    Try to enable VT100 escape sequences on Windows 10+
-
-    Returns:
-        True if VT mode enabled or already supported, False otherwise
-    """
+def _enable_windows_vt_mode_for_handle(win_handle_const: int) -> bool:
+    """Enable VT100 mode for specific Windows console handle"""
     if platform.system() != 'Windows':
         return True
 
@@ -76,80 +80,89 @@ def _enable_windows_vt_mode() -> bool:
         from ctypes import wintypes
 
         kernel32 = ctypes.windll.kernel32
+        handle = kernel32.GetStdHandle(win_handle_const)
 
-        # Get stdout handle
-        STD_OUTPUT_HANDLE = -11
-        handle = kernel32.GetStdHandle(STD_OUTPUT_HANDLE)
-        if handle == -1 or handle is None:
+        if handle in (-1, 0, None):
             return False
 
-        # Get current console mode
         mode = wintypes.DWORD()
         if not kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
             return False
 
-        # Enable ENABLE_VIRTUAL_TERMINAL_PROCESSING (0x0004)
-        ENABLE_VIRTUAL_TERMINAL_PROCESSING = 0x0004
-        new_mode = mode.value | ENABLE_VIRTUAL_TERMINAL_PROCESSING
+        ENABLE_VTP = 0x0004
+        new_mode = mode.value | ENABLE_VTP
 
-        if kernel32.SetConsoleMode(handle, new_mode):
-            return True
+        return bool(kernel32.SetConsoleMode(handle, new_mode))
 
+    except Exception:
         return False
+
+
+def _enable_windows_vt_mode() -> bool:
+    """Try to enable VT100 escape sequences on Windows 10+ for stdout and stderr"""
+    if platform.system() != 'Windows':
+        return True
+
+    try:
+        STD_OUTPUT_HANDLE = -11
+        STD_ERROR_HANDLE = -12
+
+        ok_out = _enable_windows_vt_mode_for_handle(STD_OUTPUT_HANDLE)
+        ok_err = _enable_windows_vt_mode_for_handle(STD_ERROR_HANDLE)
+
+        return ok_out or ok_err
 
     except Exception:
         return False
 
 
 def _supports_color() -> bool:
-    """
-    Detect if current terminal supports ANSI colors
-
-    Checks various environment variables and platform settings.
-
-    Returns:
-        True if colors supported, False otherwise
-    """
+    """Detect if current terminal supports ANSI colors"""
     if 'NO_COLOR' in os.environ:
         return False
 
-    if 'FORCE_COLOR' in os.environ:
+    if os.environ.get('FORCE_COLOR') or os.environ.get('CLICOLOR_FORCE') == '1':
         return True
 
     plat: str = platform.system()
-    supported_platform: bool = plat != 'Windows' or 'ANSICON' in os.environ
 
-    is_a_tty: bool = hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+    if os.environ.get('PYCHARM_HOSTED') == '1':
+        return True
 
     if plat == 'Windows':
         win_term: bool = bool(
             os.environ.get('WT_SESSION') or
             os.environ.get('TERM_PROGRAM') == 'vscode' or
-            os.environ.get('ConEmuANSI') == 'ON'
+            os.environ.get('ConEmuANSI') == 'ON' or
+            'ANSICON' in os.environ
         )
         if win_term:
             return True
 
-        # Try to enable VT processing on Windows 10+
         if _enable_windows_vt_mode():
             return True
 
-        try:
-            if sys.getwindowsversion().major >= 10:
-                return True
-        except AttributeError:
-            pass
+        return False
 
-    if 'TERM' in os.environ:
-        term: str = os.environ['TERM'].lower()
-        if term in ('xterm', 'xterm-color', 'xterm-256color', 'linux',
-                    'screen', 'screen-256color', 'vt100', 'rxvt', 'cygwin'):
-            return True
+    term: str = (os.environ.get('TERM') or '').lower()
+    if term in ('xterm', 'xterm-color', 'xterm-256color', 'linux',
+                'screen', 'screen-256color', 'vt100', 'rxvt', 'cygwin'):
+        return True
+    if term == 'dumb':
+        return False
 
     if os.environ.get('CI') == 'true' or os.environ.get('GITHUB_ACTIONS') == 'true':
         return True
 
-    return supported_platform and is_a_tty
+    return hasattr(sys.stdout, 'isatty') and sys.stdout.isatty()
+
+
+def _supports_ansi_sequences(file: TextIO = sys.stdout) -> bool:
+    """Check if given stream supports ANSI escape sequences"""
+    if platform.system() == 'Windows':
+        return _enable_windows_vt_mode()
+
+    return hasattr(file, 'isatty') and file.isatty()
 
 
 class TerminalOutputFormatter(OutputFormatter):
@@ -159,8 +172,8 @@ class TerminalOutputFormatter(OutputFormatter):
     Features:
     - Automatic color support detection
     - Styled text output
-    - Table rendering
-    - Progress bars
+    - Table rendering with stream support
+    - Progress bars with inline updates
     - Terminal size detection
     - Text wrapping
     """
@@ -229,11 +242,11 @@ class TerminalOutputFormatter(OutputFormatter):
 
         Args:
             text: Text to style
-            fg: Foreground color name
+            fg: Foreground color name or style name
             bg: Background color name
             bold: Apply bold
             underline: Apply underline
-            blink: Apply blink (may not work in all terminals)
+            blink: Apply blink
 
         Returns:
             Styled text
@@ -243,8 +256,10 @@ class TerminalOutputFormatter(OutputFormatter):
 
         codes: List[str] = []
 
-        if fg and fg in COLORS:
-            codes.append(COLORS[fg])
+        if fg:
+            style_code = STYLES.get(fg) or COLORS.get(fg)
+            if style_code:
+                codes.append(style_code)
 
         if bg:
             bg_color_map = {
@@ -281,22 +296,30 @@ class TerminalOutputFormatter(OutputFormatter):
         start: str = ''.join(codes)
         return f"{start}{text}{COLORS['reset']}"
 
-    def render_table(self, headers: List[str], rows: List[List[str]],
-                    max_col_width: Optional[int] = None) -> None:
+    def render_table(self,
+                    headers: List[str],
+                    rows: List[List[str]],
+                    max_col_width: Optional[int] = None,
+                    file: TextIO = sys.stdout) -> None:
         """
-        Render formatted table to stdout
+        Render formatted table to output stream
+
         Args:
             headers: Column headers
             rows: Table data rows
-            max_col_width: Maximum column width (None = unlimited, but respects terminal width)
+            max_col_width: Maximum column width (None = auto-calculate based on terminal)
+            file: Output stream (default: stdout)
         """
         if not headers:
             return
 
-        if max_col_width is None:
-            max_col_width = max(20, (self.terminal_width - len(headers) * 3) // len(headers))
+        num_cols = len(headers)
+        separator_overhead = 3 * num_cols + 1
+        available_width = self.terminal_width - separator_overhead
 
-        # Calculate column widths based on clean text (without ANSI codes)
+        if max_col_width is None:
+            max_col_width = max(20, available_width // num_cols)
+
         col_widths: List[int] = [min(len(self._strip_ansi(h)), max_col_width) for h in headers]
 
         for row in rows:
@@ -310,43 +333,40 @@ class TerminalOutputFormatter(OutputFormatter):
 
         separator: str = '+' + '+'.join('-' * (w + 2) for w in col_widths) + '+'
 
-        print(separator)
+        print(separator, file=file)
 
-        # Process headers
         header_cells = []
         for i, h in enumerate(headers):
             if i < len(col_widths):
                 header_cells.append(self._pad_cell(h, col_widths[i], truncate=True))
 
         header_row: str = '| ' + ' | '.join(header_cells) + ' |'
-        print(self.format(header_row, 'header'))
-        print(separator)
+        print(self.format(header_row, 'header'), file=file)
+        print(separator, file=file)
 
-        # Process data rows
         for row in rows:
             cells: List[str] = []
             for i, cell in enumerate(row):
                 if i < len(col_widths):
                     cells.append(self._pad_cell(str(cell), col_widths[i], truncate=True))
-            print('| ' + ' | '.join(cells) + ' |')
+            print('| ' + ' | '.join(cells) + ' |', file=file)
 
-        print(separator)
+        print(separator, file=file)
 
-    def _extract_ansi_codes(self, text: str) -> Tuple[List[str], str]:
-        """
-        Extract ANSI codes from text
-
-        Returns:
-            Tuple of (list of ANSI codes, clean text)
-        """
-        ansi_pattern = re.compile(r'(\033\[[0-9;]+m)')
-        codes = ansi_pattern.findall(text)
-        clean = ansi_pattern.sub('', text)
-        return codes, clean
+    def _extract_ansi_codes(self, text: str) -> Tuple[str, str]:
+        """Extract leading ANSI codes and clean text"""
+        ansi_pattern = re.compile(r'^(\033\[[0-9;]+m)+')
+        match = ansi_pattern.match(text)
+        if match:
+            prefix = match.group(0)
+            clean = text[len(prefix):]
+            return prefix, clean
+        return '', text
 
     def _pad_cell(self, text: str, width: int, truncate: bool = True) -> str:
         """
         Pad cell to specified width, handling ANSI codes correctly
+
         Args:
             text: Text to pad (may contain ANSI codes)
             width: Target display width (visible characters)
@@ -355,43 +375,22 @@ class TerminalOutputFormatter(OutputFormatter):
         Returns:
             Padded text with ANSI codes preserved
         """
-        # Extract ANSI codes and get clean text
-        ansi_codes, clean_text = self._extract_ansi_codes(text)
+        clean_text = self._strip_ansi(text)
         clean_len = len(clean_text)
 
         if truncate and clean_len > width:
-            # Truncate clean text
+            ansi_prefix, _ = self._extract_ansi_codes(text)
             truncated = clean_text[:width - 3] + '...'
 
-            # Re-apply ANSI codes if present
-            if ansi_codes and self.use_colors:
-                # Apply all codes found in original, then add reset at end
-                style_prefix = ''.join(ansi_codes)
-                return style_prefix + truncated + COLORS['reset']
-
+            if ansi_prefix:
+                return ansi_prefix + truncated + COLORS['reset']
             return truncated
 
         elif clean_len < width:
-            # Need padding
             padding_needed = width - clean_len
-
-            # If text has ANSI codes, we need to add padding after the text
-            # but before the reset code if it exists
-            if ansi_codes and self.use_colors:
-                # Check if text ends with reset code
-                if text.endswith(COLORS['reset']):
-                    # Insert padding before reset
-                    text_without_reset = text[:-len(COLORS['reset'])]
-                    return text_without_reset + ' ' * padding_needed + COLORS['reset']
-                else:
-                    # Just add padding at the end
-                    return text + ' ' * padding_needed
-            else:
-                # Plain text, just add padding
-                return text + ' ' * padding_needed
+            return text + ' ' * padding_needed
 
         else:
-            # Exactly right width
             return text
 
     def progress_bar(self,
@@ -409,7 +408,8 @@ class TerminalOutputFormatter(OutputFormatter):
                      color_threshold_low: float = 0.33,
                      color_threshold_high: float = 0.66,
                      brackets: tuple = ('[', ']'),
-                     file: TextIO = sys.stdout) -> Callable[[int], None]:
+                     file: TextIO = sys.stdout,
+                     force_inline: Optional[bool] = None) -> Callable[[int], None]:
         """
         Create progress bar update function
 
@@ -429,12 +429,13 @@ class TerminalOutputFormatter(OutputFormatter):
             color_threshold_high: Threshold for mid->high color (0.0-1.0)
             brackets: Tuple of (left_bracket, right_bracket)
             file: Output stream (default: stdout)
+            force_inline: Force inline updates (True for IDE consoles, None = auto-detect)
 
         Returns:
             Function to update progress bar with current value
         """
         if width is None:
-            width = min(50, self.terminal_width - 30)
+            width = max(1, min(50, self.terminal_width - 30))
 
         use_unicode = True
         if hasattr(file, 'encoding'):
@@ -449,9 +450,20 @@ class TerminalOutputFormatter(OutputFormatter):
                 char = '#'
                 empty_char = '-'
                 brackets = ('[', ']')
-                self._logger.debug("Using ASCII characters for progress bar (Unicode not supported)")
+                self._logger.debug("Using ASCII characters for progress bar")
 
-        use_carriage_return = hasattr(file, 'isatty') and file.isatty()
+        if force_inline is None:
+            is_tty = hasattr(file, 'isatty') and file.isatty()
+            is_ide = bool(
+                os.environ.get('PYCHARM_HOSTED') or
+                os.environ.get('TERM_PROGRAM') == 'vscode' or
+                os.environ.get('PYTEST_CURRENT_TEST')
+            )
+            use_carriage_return = is_tty or is_ide
+        else:
+            use_carriage_return = bool(force_inline)
+
+        supports_erase = _supports_ansi_sequences(file) and use_carriage_return
 
         left_bracket, right_bracket = brackets
 
@@ -460,20 +472,24 @@ class TerminalOutputFormatter(OutputFormatter):
         if suffix and not suffix.startswith(' '):
             suffix = ' ' + suffix
 
+        last_visible_len = 0
+
+        def visible_len(s: str) -> int:
+            """Get visible length of string (without ANSI codes)"""
+            return len(self._strip_ansi(s))
+
         def update(current: int) -> None:
             """Update progress bar to current value"""
+            nonlocal last_visible_len
+
             if total <= 0:
                 return
 
-            progress: float = min(1.0, current / total)
+            progress: float = max(0.0, min(1.0, current / total))
             filled: int = int(width * progress)
 
-            bar: str = char * filled + empty_char * (width - filled)
-
             percent_str: str = f" {progress * 100:5.1f}%" if show_percent else ""
-            count_str: str = f" {current}/{total}" if show_count else ""
-
-            line: str = f"{prefix}{left_bracket}{bar}{right_bracket}{percent_str}{count_str}{suffix}"
+            count_str: str = f" {max(0, current)}/{total}" if show_count else ""
 
             if self.use_colors:
                 if progress < color_threshold_low:
@@ -482,36 +498,53 @@ class TerminalOutputFormatter(OutputFormatter):
                     color = color_mid
                 else:
                     color = color_high
+                bar_visible: str = self.format(char * filled, color) + empty_char * (width - filled)
+            else:
+                bar_visible: str = char * filled + empty_char * (width - filled)
 
-                colored_bar: str = self.format(char * filled, color) + empty_char * (width - filled)
-                line = f"{prefix}{left_bracket}{colored_bar}{right_bracket}{percent_str}{count_str}{suffix}"
+            line: str = f"{prefix}{left_bracket}{bar_visible}{right_bracket}{percent_str}{count_str}{suffix}"
 
             try:
                 if use_carriage_return:
-                    print(f"\r{line}", end='', flush=True, file=file)
+                    if supports_erase:
+                        print(f"\r{line}\033[K", end='', flush=True, file=file)
+                    else:
+                        current_len = visible_len(line)
+                        pad_spaces = max(0, last_visible_len - current_len)
+                        print(f"\r{line}{' ' * pad_spaces}", end='', flush=True, file=file)
+                        last_visible_len = current_len
+
+                    if current >= total:
+                        print(file=file, flush=True)
                 else:
                     print(line, file=file, flush=True)
 
-                if current >= total and use_carriage_return:
-                    print(file=file)
             except UnicodeEncodeError:
                 simple_bar = '#' * filled + '-' * (width - filled)
                 simple_line = f"{prefix}[{simple_bar}]{percent_str}{count_str}{suffix}"
+
                 if use_carriage_return:
-                    print(f"\r{simple_line}", end='', flush=True, file=file)
+                    if supports_erase:
+                        print(f"\r{simple_line}\033[K", end='', flush=True, file=file)
+                    else:
+                        current_len = len(simple_line)
+                        pad_spaces = max(0, last_visible_len - current_len)
+                        print(f"\r{simple_line}{' ' * pad_spaces}", end='', flush=True, file=file)
+                        last_visible_len = current_len
+
+                    if current >= total:
+                        print(file=file, flush=True)
                 else:
                     print(simple_line, file=file, flush=True)
-                if current >= total and use_carriage_return:
-                    print(file=file)
 
         return update
 
-    def clear_line(self) -> None:
+    def clear_line(self, file: TextIO = sys.stdout) -> None:
         """Clear current terminal line"""
-        if self.use_colors:
-            print('\r\033[K', end='', flush=True)
+        if _supports_ansi_sequences(file):
+            print('\r\033[K', end='', flush=True, file=file)
         else:
-            print('\r' + ' ' * self.terminal_width, end='\r', flush=True)
+            print('\r' + ' ' * self.terminal_width, end='\r', flush=True, file=file)
 
     def wrap_text(self,
                   text: str,
@@ -548,15 +581,7 @@ class TerminalOutputFormatter(OutputFormatter):
         return wrapper.fill(clean_text)
 
     def _strip_ansi(self, text: str) -> str:
-        """
-        Remove ANSI escape codes from text
-
-        Args:
-            text: Text with ANSI codes
-
-        Returns:
-            Clean text without ANSI codes
-        """
+        """Remove ANSI escape codes from text"""
         ansi_escape = re.compile(
             r'\x1B(?:'
             r'[@-Z\\-_]|'
@@ -567,17 +592,44 @@ class TerminalOutputFormatter(OutputFormatter):
         return ansi_escape.sub('', text)
 
     def get_terminal_size(self) -> Tuple[int, int]:
-        """
-        Get current terminal size
-
-        Returns:
-            Tuple of (width, height)
-        """
+        """Get current terminal size"""
         self._update_terminal_size()
         return self.terminal_width, self.terminal_height
 
 
-# Helper functions
+_default_formatter: Optional[TerminalOutputFormatter] = None
+_formatter_lock = threading.Lock()
+
+
+def _get_default_formatter() -> TerminalOutputFormatter:
+    """Get or create cached default formatter"""
+    global _default_formatter
+
+    if _default_formatter is not None:
+        return _default_formatter
+
+    with _formatter_lock:
+        if _default_formatter is None:
+            _default_formatter = TerminalOutputFormatter()
+        return _default_formatter
+
+
+def echo(text: str, style: Optional[str] = None, file: TextIO = sys.stdout,
+         formatter: Optional[TerminalOutputFormatter] = None) -> None:
+    """
+    Print styled text to output stream
+
+    Args:
+        text: Text to print
+        style: Style name (success, error, warning, info, etc.)
+        file: Output stream (default: stdout)
+        formatter: Custom formatter instance (uses cached default if None)
+    """
+    if formatter is None:
+        formatter = _get_default_formatter()
+    print(formatter.format(text, style), file=file)
+
+
 def style(text: str,
           fg: Optional[str] = None,
           bg: Optional[str] = None,
@@ -590,49 +642,106 @@ def style(text: str,
 
     Args:
         text: Text to style
-        fg: Foreground color
+        fg: Foreground color or style name
         bg: Background color
         bold: Bold text
         underline: Underlined text
         blink: Blinking text
-        formatter: Custom formatter instance (creates new if None)
+        formatter: Custom formatter instance (uses cached default if None)
 
     Returns:
         Styled text string
     """
     if formatter is None:
-        formatter = TerminalOutputFormatter()
+        formatter = _get_default_formatter()
     return formatter.style_text(text, fg, bg, bold, underline, blink)
 
 
-def progress_bar(total: int, formatter: Optional[TerminalOutputFormatter] = None,
-                **kwargs: Any) -> Callable[[int], None]:
+def progress_bar(total: int,
+                 width: Optional[int] = None,
+                 char: str = '█',
+                 empty_char: str = '·',
+                 show_percent: bool = True,
+                 show_count: bool = True,
+                 prefix: str = '',
+                 suffix: str = '',
+                 color_low: str = 'yellow',
+                 color_mid: str = 'blue',
+                 color_high: str = 'green',
+                 color_threshold_low: float = 0.33,
+                 color_threshold_high: float = 0.66,
+                 brackets: tuple = ('[', ']'),
+                 file: TextIO = sys.stdout,
+                 force_inline: Optional[bool] = None,
+                 formatter: Optional[TerminalOutputFormatter] = None) -> Callable[[int], None]:
     """
     Create progress bar update function
 
     Args:
-        total: Total iterations
-        formatter: Custom formatter instance (creates new if None)
-        **kwargs: Additional options (see TerminalOutputFormatter.progress_bar)
+        total: Total number of iterations
+        width: Progress bar width (None = auto-calculate based on terminal)
+        char: Character for filled portion (default: '█')
+        empty_char: Character for empty portion (default: '·')
+        show_percent: Show percentage indicator
+        show_count: Show count as "current/total"
+        prefix: Text to display before progress bar
+        suffix: Text to display after progress bar
+        color_low: Color for 0-33% progress (default: 'yellow')
+        color_mid: Color for 33-66% progress (default: 'blue')
+        color_high: Color for 66-100% progress (default: 'green')
+        color_threshold_low: Threshold for low->mid color transition (0.0-1.0)
+        color_threshold_high: Threshold for mid->high color transition (0.0-1.0)
+        brackets: Tuple of (left_bracket, right_bracket) characters
+        file: Output stream (default: stdout)
+        force_inline: Force inline updates (True for IDE consoles, None = auto-detect)
+        formatter: Custom formatter instance (uses cached default if None)
 
     Returns:
-        Update function that takes current value
+        Update function that takes current progress value as argument
+
+    Example:
+        >>> update = progress_bar(100, prefix="Processing")
+        >>> for i in range(100):
+        ...     do_work(i)
+        ...     update(i + 1)
     """
     if formatter is None:
-        formatter = TerminalOutputFormatter()
-    return formatter.progress_bar(total, **kwargs)
+        formatter = _get_default_formatter()
+    return formatter.progress_bar(
+        total=total,
+        width=width,
+        char=char,
+        empty_char=empty_char,
+        show_percent=show_percent,
+        show_count=show_count,
+        prefix=prefix,
+        suffix=suffix,
+        color_low=color_low,
+        color_mid=color_mid,
+        color_high=color_high,
+        color_threshold_low=color_threshold_low,
+        color_threshold_high=color_threshold_high,
+        brackets=brackets,
+        file=file,
+        force_inline=force_inline
+    )
 
 
-def table(headers: List[str], rows: List[List[str]],
+def table(headers: List[str],
+         rows: List[List[str]],
+         max_col_width: Optional[int] = None,
+         file: TextIO = sys.stdout,
          formatter: Optional[TerminalOutputFormatter] = None) -> None:
     """
-    Render table to stdout
+    Render table to output stream
 
     Args:
         headers: Column headers
         rows: Table data rows
-        formatter: Custom formatter instance (creates new if None)
+        max_col_width: Maximum column width (None = auto-calculate)
+        file: Output stream (default: stdout)
+        formatter: Custom formatter instance (uses cached default if None)
     """
     if formatter is None:
-        formatter = TerminalOutputFormatter()
-    formatter.render_table(headers, rows)
+        formatter = _get_default_formatter()
+    formatter.render_table(headers, rows, max_col_width, file)

@@ -12,11 +12,13 @@ import warnings
 import asyncio
 import threading
 import copy
-from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, cast
+from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, cast, Tuple
 
 _logger: logging.Logger = logging.getLogger('cliframework.decorators')
 
 F = TypeVar('F', bound=Callable[..., Any])
+
+RESERVED_NAMES = {'help', 'h', '_cli_help', '_cli_show_help'}
 
 
 class CommandMetadataRegistry:
@@ -57,7 +59,7 @@ class CommandMetadataRegistry:
             self._registered.add(func_id)
 
     def register_group_class(self, group_name: str, cls: Type[Any]) -> None:
-        """Register a command group class (without instantiating)"""
+        """Register a command group class"""
         with self._lock:
             self._group_classes[group_name] = cls
 
@@ -77,7 +79,7 @@ class CommandMetadataRegistry:
             return func_id in self._group_method_ids
 
     def clear(self) -> None:
-        """Clear all metadata (useful for testing)"""
+        """Clear all metadata"""
         with self._lock:
             self._metadata.clear()
             self._registered.clear()
@@ -85,17 +87,16 @@ class CommandMetadataRegistry:
             self._group_method_ids.clear()
 
     def get_all_metadata(self) -> Dict[int, Dict[str, Any]]:
-        """Get all metadata (deep copy)"""
+        """Get all metadata"""
         with self._lock:
             return {fid: copy.deepcopy(meta) for fid, meta in self._metadata.items()}
 
 
-# Global registry instance
 _registry = CommandMetadataRegistry()
 
 
 def is_async_function(func: Callable[..., Any]) -> bool:
-    """Check if function is async (coroutine function)"""
+    """Check if function is async"""
     return inspect.iscoroutinefunction(func)
 
 
@@ -105,6 +106,21 @@ def _get_func_id(func: Callable[..., Any]) -> int:
     while hasattr(original, '__wrapped__'):
         original = original.__wrapped__
     return id(original)
+
+
+def _validate_name_not_reserved(name: str, context: str) -> None:
+    """
+    Validate that name doesn't conflict with reserved names
+
+    Args:
+        name: Name to validate
+        context: Context string for error message (e.g., "argument", "option")
+    """
+    if name in RESERVED_NAMES or name.lstrip('-') in RESERVED_NAMES:
+        raise ValueError(
+            f"{context.capitalize()} name '{name}' conflicts with reserved help flag. "
+            f"Reserved names: {', '.join(RESERVED_NAMES)}"
+        )
 
 
 def _ensure_command_metadata(func: Callable[..., Any]) -> Dict[str, Any]:
@@ -126,6 +142,8 @@ def _ensure_command_metadata(func: Callable[..., Any]) -> Dict[str, Any]:
         if param_name in ('self', 'cls'):
             continue
 
+        _validate_name_not_reserved(param_name, "parameter")
+
         param_type: Type[Any] = (
             param.annotation
             if param.annotation != inspect.Parameter.empty
@@ -144,7 +162,8 @@ def _ensure_command_metadata(func: Callable[..., Any]) -> Dict[str, Any]:
             arguments.append({
                 'name': param_name,
                 'help': f"Argument {param_name}",
-                'type': param_type
+                'type': param_type,
+                'optional': False
             })
 
     is_async = is_async_function(func)
@@ -173,7 +192,14 @@ def _ensure_command_metadata(func: Callable[..., Any]) -> Dict[str, Any]:
 def command(name: Optional[str] = None,
             help: Optional[str] = None,
             aliases: Optional[List[str]] = None) -> Callable[[F], F]:
-    """Decorator to define CLI command"""
+    """
+    Decorator to define CLI command
+
+    Args:
+        name: Command name (defaults to function name)
+        help: Help text (defaults to function docstring)
+        aliases: Alternative command names
+    """
 
     def decorator(func: F) -> F:
         if not callable(func):
@@ -184,10 +210,13 @@ def command(name: Optional[str] = None,
 
         updates: Dict[str, Any] = {}
         if name is not None:
+            _validate_name_not_reserved(name, "command name")
             updates['name'] = name
         if help is not None:
             updates['help'] = help
         if aliases is not None:
+            for alias in aliases:
+                _validate_name_not_reserved(alias, "command alias")
             updates['aliases'] = list(aliases)
 
         if updates:
@@ -201,12 +230,23 @@ def command(name: Optional[str] = None,
 
 def argument(name: str,
              help: Optional[str] = None,
-             type: Type[Any] = str) -> Callable[[F], F]:
-    """Decorator to define positional argument"""
+             type: Type[Any] = str,
+             optional: bool = False) -> Callable[[F], F]:
+    """
+    Decorator to define positional argument
+
+    Args:
+        name: Argument name
+        help: Help text
+        type: Argument type
+        optional: Whether argument is optional (must be last if True)
+    """
 
     def decorator(func: F) -> F:
         if not callable(func):
             raise TypeError("@argument can only be applied to callable")
+
+        _validate_name_not_reserved(name, "argument")
 
         func_id = _get_func_id(func)
         metadata = _ensure_command_metadata(func)
@@ -229,7 +269,8 @@ def argument(name: str,
         arguments.append({
             'name': name,
             'help': help or f"Argument {name}",
-            'type': type
+            'type': type,
+            'optional': optional
         })
 
         _registry.update_metadata(func_id, {
@@ -243,7 +284,10 @@ def argument(name: str,
     return decorator
 
 
-def _validate_short_uniqueness(options: List[Dict[str, Any]], new_short: Optional[str], new_name: str, command_name: str) -> None:
+def _validate_short_uniqueness(options: List[Dict[str, Any]],
+                               new_short: Optional[str],
+                               new_name: str,
+                               command_name: str) -> None:
     """Validate that short option is unique within command"""
     if new_short is None:
         return
@@ -255,8 +299,7 @@ def _validate_short_uniqueness(options: List[Dict[str, Any]], new_short: Optiona
         if existing_short == new_short:
             raise ValueError(
                 f"Short option '-{new_short}' conflicts with existing option "
-                f"'--{opt['name']}' in command '{command_name}'. "
-                f"Each short option must be unique."
+                f"'--{opt['name']}' in command '{command_name}'"
             )
 
 
@@ -266,13 +309,24 @@ def option(name: str,
            type: Type[Any] = str,
            default: Any = None,
            is_flag: bool = False) -> Callable[[F], F]:
-    """Decorator to define command option"""
+    """
+    Decorator to define command option
+
+    Args:
+        name: Option name (without -- prefix)
+        short: Short option (single character, without - prefix)
+        help: Help text
+        type: Option type
+        default: Default value
+        is_flag: Whether this is a boolean flag
+    """
 
     def decorator(func: F) -> F:
         if not callable(func):
             raise TypeError("@option can only be applied to callable")
 
         normalized_name: str = name[2:] if name.startswith('--') else name
+        _validate_name_not_reserved(normalized_name, "option")
 
         normalized_short: Optional[str] = None
         if short:
@@ -281,6 +335,7 @@ def option(name: str,
                 raise ValueError(
                     f"Short option must be a single character, got: '{short}'"
                 )
+            _validate_name_not_reserved(normalized_short, "short option")
 
         func_id = _get_func_id(func)
         metadata = _ensure_command_metadata(func)
@@ -288,7 +343,6 @@ def option(name: str,
         options = list(metadata.get('options', []))
         arguments = list(metadata.get('arguments', []))
 
-        # Validate short option uniqueness
         _validate_short_uniqueness(options, normalized_short, normalized_name, metadata['name'])
 
         existing_opt_names = [opt['name'] for opt in options]
@@ -324,7 +378,12 @@ def option(name: str,
 
 
 def example(example_text: str) -> Callable[[F], F]:
-    """Decorator to add usage example to command"""
+    """
+    Decorator to add usage example to command
+
+    Args:
+        example_text: Example usage string
+    """
 
     def decorator(func: F) -> F:
         if not callable(func):
@@ -348,14 +407,17 @@ def group(name: Optional[str] = None,
           help: Optional[str] = None) -> Callable[[Type[Any]], Type[Any]]:
     """
     Decorator to define command group
+
+    Args:
+        name: Group name (defaults to class name)
+        help: Help text (defaults to class docstring)
     """
 
     def decorator(cls: Type[Any]) -> Type[Any]:
         group_name: str = name or cls.__name__.lower()
         group_help: str = help or inspect.getdoc(cls) or f"Command group {group_name}"
 
-        # Scan class methods for decorated commands (without instantiating)
-        command_methods: List[tuple[str, Any]] = []
+        command_methods: List[Tuple[str, Any]] = []
 
         for attr_name in dir(cls):
             if attr_name.startswith('_'):
@@ -371,7 +433,6 @@ def group(name: Optional[str] = None,
                     _registry.mark_as_group_method(func_id)
                     command_methods.append((attr_name, attr))
             except AttributeError:
-                # Skip attributes that can't be accessed on the class
                 continue
 
         cls.__cli_group_info__ = {
@@ -380,7 +441,6 @@ def group(name: Optional[str] = None,
             'methods': command_methods
         }
 
-        # Register the class (not an instance)
         _registry.register_group_class(group_name, cls)
 
         _logger.debug(
@@ -393,18 +453,14 @@ def group(name: Optional[str] = None,
 
 
 def register_commands(cli_instance: Any) -> int:
-    """
-    Register all decorated commands with CLI instance
-    """
+    """Register all decorated commands with CLI instance"""
     registered_count: int = 0
     all_metadata = _registry.get_all_metadata()
 
-    # Register standalone commands (excluding group methods)
     for func_id, metadata in all_metadata.items():
         if _registry.is_registered(func_id):
             continue
 
-        # Skip if this is a group method
         if _registry.is_group_method(func_id):
             continue
 
@@ -433,12 +489,10 @@ def register_commands(cli_instance: Any) -> int:
             import traceback
             _logger.error(traceback.format_exc())
 
-    # Process explicitly registered group classes
     group_classes = _registry.get_group_classes()
 
     for group_name, group_class in group_classes.items():
         try:
-            # NOW we instantiate, but only for explicitly registered groups
             instance = group_class()
 
             group_info = group_class.__cli_group_info__
@@ -483,6 +537,6 @@ def register_commands(cli_instance: Any) -> int:
 
 
 def clear_registry() -> None:
-    """Clear command registry (useful for testing)"""
+    """Clear command registry"""
     _registry.clear()
     _logger.debug("Command registry cleared")

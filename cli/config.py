@@ -3,10 +3,6 @@ Configuration management with cross-platform file locking
 
 Provides secure, thread-safe configuration storage with JSON schemas,
 hierarchical key access, and automatic backup recovery.
-
-Note on sensitive keys: Keys containing 'password', 'token', 'secret', etc.
-are automatically masked in logs. This may hide non-sensitive fields with
-similar names - configure additional sensitive_keys if needed.
 """
 
 import json
@@ -16,7 +12,10 @@ import tempfile
 import platform
 import time
 import copy
-from typing import Any, Dict, Optional, Set, List
+import re
+from typing import Any, Dict, Optional, Set, List, Pattern
+
+from .interfaces import ConfigProvider
 
 try:
     import jsonschema
@@ -31,11 +30,19 @@ else:
     import fcntl
     LOCK_METHOD = 'posix'
 
-SENSITIVE_KEYS: Set[str] = {
-    'password', 'passwd', 'pwd',
-    'token', 'api_key', 'apikey', 'api_secret',
-    'secret', 'private_key', 'auth',
-    'credentials', 'certificate'
+SENSITIVE_KEY_PATTERNS: Set[Pattern] = {
+    re.compile(r'^.*password$', re.IGNORECASE),
+    re.compile(r'^.*passwd$', re.IGNORECASE),
+    re.compile(r'^.*pwd$', re.IGNORECASE),
+    re.compile(r'^.*token$', re.IGNORECASE),
+    re.compile(r'^.*api[_-]?key$', re.IGNORECASE),
+    re.compile(r'^.*apikey$', re.IGNORECASE),
+    re.compile(r'^.*api[_-]?secret$', re.IGNORECASE),
+    re.compile(r'^.*secret$', re.IGNORECASE),
+    re.compile(r'^.*private[_-]?key$', re.IGNORECASE),
+    re.compile(r'^.*auth$', re.IGNORECASE),
+    re.compile(r'^.*credentials?$', re.IGNORECASE),
+    re.compile(r'^.*certificate$', re.IGNORECASE),
 }
 
 
@@ -60,12 +67,7 @@ class ConfigLockError(ConfigError):
 
 
 class FileLock:
-    """
-    Cross-platform file locking mechanism with timeout support
-
-    Configurable stale lock detection prevents deadlocks from crashed processes.
-    On POSIX systems, UID isolation ensures user-specific locks.
-    """
+    """Cross-platform file locking with timeout and stale detection"""
 
     def __init__(self, file_path: str, timeout: float = 10.0, stale_timeout: float = 300.0):
         """
@@ -75,7 +77,6 @@ class FileLock:
             file_path: Path to file to lock
             timeout: Maximum time to wait for lock acquisition (seconds)
             stale_timeout: Age threshold for considering lock stale (seconds)
-                          Set higher than your longest expected operation
         """
         self.file_path: str = file_path
         self.lock_path: str = f"{file_path}.lock"
@@ -96,10 +97,19 @@ class FileLock:
             return True
 
         start_time: float = time.time()
+        lock_file_created_by_us = False
 
         while time.time() - start_time < self.timeout:
             try:
                 os.makedirs(os.path.dirname(self.lock_path) or '.', exist_ok=True)
+
+                if os.path.exists(self.lock_path):
+                    if self._is_stale_lock():
+                        self._logger.debug("Detected stale lock, removing")
+                        self._safe_remove_lock_file()
+                    else:
+                        time.sleep(poll_interval)
+                        continue
 
                 try:
                     fd = os.open(
@@ -111,26 +121,31 @@ class FileLock:
                     lock_info = f"{self._pid}:{self._uid}\n"
                     os.write(fd, lock_info.encode('utf-8'))
                     os.close(fd)
-
-                    self.lock_file = open(self.lock_path, 'r+')
+                    lock_file_created_by_us = True
 
                 except FileExistsError:
                     if self._is_stale_lock():
+                        self._logger.debug("Lock created by another process but is stale")
                         self._safe_remove_lock_file()
                         continue
                     time.sleep(poll_interval)
                     continue
 
+                self.lock_file = open(self.lock_path, 'r+')
+
                 if LOCK_METHOD == 'windows':
                     try:
-                        msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                        msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_NBLCK, 0x7FFF0000)
                         self.is_locked = True
                         self._logger.debug(f"Lock acquired (PID: {self._pid})")
                         return True
                     except (IOError, OSError) as e:
                         self._logger.debug(f"Windows lock failed: {e}")
                         self.lock_file.close()
-                        self._safe_remove_lock_file()
+                        self.lock_file = None
+                        if lock_file_created_by_us:
+                            self._safe_remove_lock_file()
+                            lock_file_created_by_us = False
                         time.sleep(poll_interval)
                         continue
                 else:
@@ -142,7 +157,10 @@ class FileLock:
                     except (IOError, BlockingIOError, OSError) as e:
                         self._logger.debug(f"POSIX lock failed: {e}")
                         self.lock_file.close()
-                        self._safe_remove_lock_file()
+                        self.lock_file = None
+                        if lock_file_created_by_us:
+                            self._safe_remove_lock_file()
+                            lock_file_created_by_us = False
                         time.sleep(poll_interval)
                         continue
 
@@ -152,22 +170,20 @@ class FileLock:
                         self.lock_file.close()
                     except (OSError, IOError) as close_err:
                         self._logger.debug(f"Could not close lock file: {close_err}")
-                self._safe_remove_lock_file()
+                    self.lock_file = None
+                if lock_file_created_by_us:
+                    self._safe_remove_lock_file()
                 self._logger.error(f"Failed to acquire lock: {e}")
                 raise ConfigLockError(f"Failed to acquire lock: {e}")
+
+        if lock_file_created_by_us:
+            self._safe_remove_lock_file()
 
         self._logger.error(f"Lock acquisition timeout after {self.timeout}s")
         return False
 
     def _is_stale_lock(self) -> bool:
-        """
-        Check if lock file is stale
-
-        A lock is considered stale if:
-        1. It's older than stale_timeout seconds AND
-        2. The owning process no longer exists OR
-        3. (On POSIX) The owning process belongs to a different user
-        """
+        """Check if lock file is stale based on age and process existence"""
         try:
             if not os.path.exists(self.lock_path):
                 return False
@@ -197,16 +213,28 @@ class FileLock:
                 if platform.system() == 'Windows':
                     try:
                         import ctypes
+                        from ctypes import wintypes
+
                         kernel32 = ctypes.windll.kernel32
-                        PROCESS_QUERY_INFORMATION = 0x0400
-                        handle = kernel32.OpenProcess(PROCESS_QUERY_INFORMATION, False, old_pid)
-                        if handle:
-                            kernel32.CloseHandle(handle)
-                            return False
-                        return True
+                        PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+
+                        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, old_pid)
+                        if not handle:
+                            error = ctypes.get_last_error()
+                            if error == 5:
+                                self._logger.debug(
+                                    f"Cannot verify process {old_pid} (access denied), "
+                                    f"assuming valid lock"
+                                )
+                                return False
+                            return True
+
+                        kernel32.CloseHandle(handle)
+                        return False
+
                     except Exception as e:
                         self._logger.debug(f"Could not check process on Windows: {e}")
-                        return True
+                        return False
                 else:
                     try:
                         os.kill(old_pid, 0)
@@ -219,6 +247,14 @@ class FileLock:
                                 return False
                         return False
                     except (OSError, ProcessLookupError):
+                        if old_uid_str.isdigit():
+                            old_uid = int(old_uid_str)
+                            if old_uid != self._uid:
+                                self._logger.debug(
+                                    f"Dead process from different user (UID {old_uid}), "
+                                    f"not removing"
+                                )
+                                return False
                         return True
 
             except (OSError, IOError, ValueError) as e:
@@ -238,7 +274,7 @@ class FileLock:
             if LOCK_METHOD == 'windows':
                 if self.lock_file:
                     try:
-                        msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+                        msvcrt.locking(self.lock_file.fileno(), msvcrt.LK_UNLCK, 0x7FFF0000)
                     except (IOError, OSError):
                         pass
             else:
@@ -276,28 +312,49 @@ class FileLock:
         self.release()
 
 
-def sanitize_for_logging(data: Dict[str, Any], sensitive_keys: Optional[Set[str]] = None) -> Dict[str, Any]:
+def sanitize_for_logging(data: Dict[str, Any],
+                         sensitive_patterns: Optional[Set[Pattern]] = None) -> Dict[str, Any]:
     """
-    Sanitize sensitive data for logging
+    Sanitize sensitive data for logging with precise pattern matching
 
-    Note: Keys are matched by substring, so 'user_password' will be masked.
-    This may hide non-sensitive fields - configure additional patterns if needed.
+    Args:
+        data: Dictionary to sanitize
+        sensitive_patterns: Additional patterns beyond default set
+
+    Returns:
+        Sanitized dictionary with sensitive values masked
     """
-    if sensitive_keys is None:
-        sensitive_keys = SENSITIVE_KEYS
+    if sensitive_patterns is None:
+        sensitive_patterns = SENSITIVE_KEY_PATTERNS
     else:
-        sensitive_keys = SENSITIVE_KEYS | sensitive_keys
+        sensitive_patterns = SENSITIVE_KEY_PATTERNS | sensitive_patterns
 
-    def _sanitize_value(key: str, value: Any) -> Any:
-        key_lower = key.lower()
-        if any(sensitive in key_lower for sensitive in sensitive_keys):
+    def _is_sensitive_key(key: str) -> bool:
+        """Check if key matches sensitive patterns"""
+        for pattern in sensitive_patterns:
+            if pattern.match(key):
+                return True
+        return False
+
+    def _sanitize_value(key: str, value: Any, parent_is_sensitive: bool = False) -> Any:
+        """
+        Recursively sanitize values
+
+        Args:
+            key: Current key name
+            value: Value to check
+            parent_is_sensitive: Whether parent key was sensitive
+        """
+        if _is_sensitive_key(key):
             return '***REDACTED***'
 
         if isinstance(value, dict):
-            return {k: _sanitize_value(k, v) for k, v in value.items()}
+            return {k: _sanitize_value(k, v, parent_is_sensitive) for k, v in value.items()}
 
         if isinstance(value, list):
-            return [_sanitize_value(f"{key}[{i}]", item) for i, item in enumerate(value)]
+            if parent_is_sensitive:
+                return ['***REDACTED***'] * len(value)
+            return [_sanitize_value(key, item, parent_is_sensitive) for item in value]
 
         return value
 
@@ -317,8 +374,8 @@ def deep_merge(base: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
     return result
 
 
-class JsonConfigProvider:
-    """JSON-based configuration provider with advanced features"""
+class JsonConfigProvider(ConfigProvider):
+    """JSON-based configuration provider with file locking and schema validation"""
 
     def __init__(self,
                  config_path: str,
@@ -377,17 +434,35 @@ class JsonConfigProvider:
             self._logger.info(f"Config file does not exist: {self._config_path}")
             return
 
+        lock = FileLock(
+            self._config_path,
+            timeout=self._lock_timeout,
+            stale_timeout=self._stale_lock_timeout
+        )
+
         try:
-            with open(self._config_path, 'r', encoding='utf-8') as f:
-                loaded_config: Dict[str, Any] = json.load(f)
+            with lock:
+                with open(self._config_path, 'r', encoding='utf-8') as f:
+                    loaded_config: Dict[str, Any] = json.load(f)
 
-            self._validate_schema(loaded_config)
-            self._config = deep_merge(self._config, loaded_config)
+                self._validate_schema(loaded_config)
+                self._config = deep_merge(self._config, loaded_config)
 
-            self._logger.debug(
-                f"Config loaded from {self._config_path}: "
-                f"{sanitize_for_logging(self._config)}"
-            )
+                self._logger.debug(
+                    f"Config loaded from {self._config_path}: "
+                    f"{sanitize_for_logging(self._config)}"
+                )
+
+        except ConfigLockError as e:
+            self._logger.warning(f"Could not acquire lock for reading config: {e}")
+            try:
+                with open(self._config_path, 'r', encoding='utf-8') as f:
+                    loaded_config = json.load(f)
+                self._validate_schema(loaded_config)
+                self._config = deep_merge(self._config, loaded_config)
+                self._logger.warning("Read config without lock (possible race condition)")
+            except Exception as read_err:
+                self._logger.error(f"Failed to read config even without lock: {read_err}")
 
         except UnicodeDecodeError as e:
             self._logger.error(f"Encoding error reading config: {e}")
@@ -445,7 +520,6 @@ class JsonConfigProvider:
                 f.flush()
                 os.fsync(f.fileno())
 
-            # Atomic rename works on all platforms
             os.replace(temp_path, self._config_path)
 
             self._logger.debug(f"Config saved to {self._config_path}")

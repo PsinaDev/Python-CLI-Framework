@@ -9,6 +9,7 @@ import argparse
 import json
 import logging
 import copy
+import threading
 from typing import Any, Dict, List, Optional, Set, Type, Callable, Union, Tuple, get_origin, get_args
 from collections import OrderedDict
 from .interfaces import CommandRegistry, ArgumentParser
@@ -24,7 +25,7 @@ class _TrieNode:
 
 
 class CommandTrie:
-    """Trie (prefix tree) for efficient command autocomplete"""
+    """Trie for efficient command autocomplete"""
 
     def __init__(self) -> None:
         self.root: _TrieNode = _TrieNode()
@@ -65,14 +66,8 @@ class CommandTrie:
         return sorted(results)
 
     def remove(self, command: str) -> bool:
-        """
-        Remove command from trie
-
-        Returns:
-            True if command was found and removed, False otherwise
-        """
+        """Remove command from trie"""
         def _remove_helper(node: _TrieNode, cmd: str, depth: int) -> Tuple[bool, bool]:
-            """Returns (was_removed, should_delete_node)"""
             if depth == len(cmd):
                 if not node.is_end:
                     return False, False
@@ -112,7 +107,7 @@ class CommandMeta:
         return self._metadata.get(key, default)
 
     def to_dict(self) -> Dict[str, Any]:
-        """Convert to dictionary (deep copy)"""
+        """Convert to dictionary"""
         return copy.deepcopy(self._metadata)
 
     @property
@@ -122,9 +117,7 @@ class CommandMeta:
 
 
 class CommandRegistryImpl(CommandRegistry):
-    """
-    Command registry with aliases, groups, and efficient search
-    """
+    """Thread-safe command registry with aliases and groups"""
 
     def __init__(self) -> None:
         self._commands: Dict[str, CommandMeta] = {}
@@ -133,176 +126,197 @@ class CommandRegistryImpl(CommandRegistry):
         self._trie: CommandTrie = CommandTrie()
         self._logger: logging.Logger = logging.getLogger('cliframework.command_registry')
         self._parser_cache_invalidator: Optional[Callable[[str], None]] = None
+        self._lock = threading.Lock()
 
     def register(self, name: str, handler: Callable[..., Any], **metadata: Any) -> None:
-        """
-        Register command with metadata
-        """
-        try:
-            if metadata.get('is_group', False):
-                self._groups[name] = copy.deepcopy(metadata)
-                self._logger.debug(f"Registered command group: {name}")
-                return
+        """Register command with metadata"""
+        with self._lock:
+            try:
+                if metadata.get('is_group', False):
+                    self._groups[name] = copy.deepcopy(metadata)
+                    self._logger.info(f"Registered command group: {name}")
+                    return
 
-            if name in self._commands:
-                old_meta = self._commands[name]
-                old_aliases = old_meta.get('aliases', [])
+                if name in self._commands:
+                    old_meta = self._commands[name]
+                    old_aliases = old_meta.get('aliases', [])
 
-                # Remove all old aliases that point to this command
-                for alias in old_aliases:
-                    if alias in self._aliases and self._aliases[alias] == name:
-                        del self._aliases[alias]
-                        self._trie.remove(alias)
-                        self._logger.debug(f"Removed old alias '{alias}' for command '{name}'")
+                    for alias in old_aliases:
+                        if alias in self._aliases and self._aliases[alias] == name:
+                            del self._aliases[alias]
+                            self._trie.remove(alias)
+                            self._logger.debug(f"Removed old alias '{alias}' for command '{name}'")
 
-                # Remove the old command itself from trie
-                self._trie.remove(name)
+                    self._trie.remove(name)
 
-            cmd_meta = CommandMeta(handler, **metadata)
-            self._commands[name] = cmd_meta
-            self._trie.insert(name)
-            self._logger.debug(f"Registered command: {name}")
+                requested_aliases = list(metadata.get('aliases', []))
+                registered_aliases = []
 
-            # Register new aliases
-            aliases: List[str] = metadata.get('aliases', [])
-            for alias in aliases:
-                if alias in self._commands:
-                    self._logger.warning(
-                        f"Alias '{alias}' conflicts with existing command, skipping"
-                    )
-                    continue
-
-                if alias in self._aliases:
-                    old_target = self._aliases[alias]
-                    if old_target != name:
+                for alias in requested_aliases:
+                    if alias in self._commands:
                         self._logger.warning(
-                            f"Alias '{alias}' previously pointed to '{old_target}', "
-                            f"now reassigning to '{name}'"
+                            f"Alias '{alias}' conflicts with existing command, skipping"
                         )
-                        self._trie.remove(alias)
+                        continue
 
-                self._aliases[alias] = name
-                self._trie.insert(alias)
-                self._logger.debug(f"Registered alias '{alias}' for command '{name}'")
+                    if alias in self._aliases:
+                        old_target = self._aliases[alias]
+                        if old_target != name:
+                            self._logger.warning(
+                                f"Alias '{alias}' previously pointed to '{old_target}', "
+                                f"now reassigning to '{name}'"
+                            )
+                            self._trie.remove(alias)
 
-            # Invalidate parser cache for this command and its aliases
+                    self._aliases[alias] = name
+                    self._trie.insert(alias)
+                    registered_aliases.append(alias)
+                    self._logger.debug(f"Registered alias '{alias}' for command '{name}'")
+
+                metadata_copy = copy.deepcopy(metadata)
+                metadata_copy['aliases'] = registered_aliases
+
+                cmd_meta = CommandMeta(handler, **metadata_copy)
+                self._commands[name] = cmd_meta
+                self._trie.insert(name)
+                self._logger.info(f"Registered command: {name}")
+
+                if self._parser_cache_invalidator:
+                    self._parser_cache_invalidator(name)
+                    for alias in registered_aliases:
+                        self._parser_cache_invalidator(alias)
+
+            except Exception as e:
+                self._logger.error(f"Error registering command '{name}': {e}")
+                raise
+
+    def get_command(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get command metadata by name or alias"""
+        with self._lock:
+            if name in self._aliases:
+                real_name: str = self._aliases[name]
+                cmd_meta = self._commands.get(real_name)
+                return cmd_meta.to_dict() if cmd_meta else None
+
+            cmd_meta = self._commands.get(name)
+            return cmd_meta.to_dict() if cmd_meta else None
+
+    def list_commands(self) -> List[str]:
+        """Get list of all command names"""
+        with self._lock:
+            return sorted(self._commands.keys())
+
+    def autocomplete(self, prefix: str) -> List[str]:
+        """Get commands matching prefix using trie"""
+        with self._lock:
+            return self._trie.autocomplete(prefix)
+
+    def remove_command(self, name: str) -> bool:
+        """Remove command from registry"""
+        with self._lock:
+            if name not in self._commands:
+                return False
+
+            cmd_meta: CommandMeta = self._commands[name]
+            aliases: List[str] = cmd_meta.get('aliases', [])
+
+            del self._commands[name]
+            self._trie.remove(name)
+
+            for alias in aliases:
+                if alias in self._aliases and self._aliases[alias] == name:
+                    del self._aliases[alias]
+                    self._trie.remove(alias)
+
             if self._parser_cache_invalidator:
                 self._parser_cache_invalidator(name)
                 for alias in aliases:
                     self._parser_cache_invalidator(alias)
 
-        except Exception as e:
-            self._logger.error(f"Error registering command '{name}': {e}")
-            raise
-
-    def get_command(self, name: str) -> Optional[Dict[str, Any]]:
-        """Get command metadata by name or alias"""
-        if name in self._aliases:
-            real_name: str = self._aliases[name]
-            cmd_meta = self._commands.get(real_name)
-            return cmd_meta.to_dict() if cmd_meta else None
-
-        cmd_meta = self._commands.get(name)
-        return cmd_meta.to_dict() if cmd_meta else None
-
-    def list_commands(self) -> List[str]:
-        """Get list of all command names"""
-        return sorted(self._commands.keys())
-
-    def autocomplete(self, prefix: str) -> List[str]:
-        """Get commands matching prefix using trie"""
-        return self._trie.autocomplete(prefix)
-
-    def remove_command(self, name: str) -> bool:
-        """Remove command from registry"""
-        if name not in self._commands:
-            return False
-
-        cmd_meta: CommandMeta = self._commands[name]
-        aliases: List[str] = cmd_meta.get('aliases', [])
-
-        del self._commands[name]
-        self._trie.remove(name)
-
-        for alias in aliases:
-            if alias in self._aliases and self._aliases[alias] == name:
-                del self._aliases[alias]
-                self._trie.remove(alias)
-
-        if self._parser_cache_invalidator:
-            self._parser_cache_invalidator(name)
-            for alias in aliases:
-                self._parser_cache_invalidator(alias)
-
-        self._logger.debug(f"Removed command: {name}")
-        return True
+            self._logger.info(f"Removed command: {name}")
+            return True
 
     def set_parser_cache_invalidator(self, invalidator: Callable[[str], None]) -> None:
-        """Set callback to invalidate parser cache when command is removed"""
+        """Set callback to invalidate parser cache"""
         self._parser_cache_invalidator = invalidator
 
     def get_all_groups(self) -> Dict[str, Dict[str, Any]]:
         """Get all registered command groups"""
-        return copy.deepcopy(self._groups)
+        with self._lock:
+            return copy.deepcopy(self._groups)
 
 
 VALID_BASIC_TYPES: Set[Type[Any]] = {str, int, float, bool}
 
 
-def validate_type(param_type: Any) -> Union[Type[Any], Callable[[str], Any]]:
+def validate_type(param_type: Any, strict: bool = False) -> Union[Type[Any], Callable[[str], Any]]:
     """
     Validate and normalize parameter type
+
+    Args:
+        param_type: Type to validate
+        strict: If True, raise ValueError for unsupported types
+
+    Returns:
+        Validated type or converter function
     """
-    # Handle basic types
+    logger = logging.getLogger('cliframework.command')
+
     if param_type in VALID_BASIC_TYPES:
         return param_type
 
-    # Handle callable converters
     if callable(param_type) and not isinstance(param_type, type):
         return param_type
 
-    # Handle generic types
     origin = get_origin(param_type)
 
     if origin is not None:
-        # Handle container types
         if origin in (list, dict, tuple):
+            args = get_args(param_type)
+            if args:
+                type_repr = f"{origin.__name__}[{', '.join(str(a) for a in args)}]"
+                logger.info(
+                    f"Parameter type {type_repr} has element types specified. "
+                    f"Note: element types will not be validated during parsing"
+                )
             return origin
 
-        # Handle Union/Optional types
         if origin is Union:
             args = get_args(param_type)
             non_none_args = [arg for arg in args if arg is not type(None)]
 
             if len(non_none_args) == 1:
-                # Optional[T] case
-                return validate_type(non_none_args[0])
+                return validate_type(non_none_args[0], strict)
             elif len(non_none_args) > 1:
-                # Union[T1, T2, ...] case
-                # Check if all types are the same basic category
                 basic_types = [arg for arg in non_none_args if arg in VALID_BASIC_TYPES]
+
                 if len(basic_types) == len(non_none_args):
-                    # All are basic types - use str as safe fallback
-                    logger = logging.getLogger('cliframework.command')
+                    type_names = [t.__name__ for t in non_none_args]
+                    if strict:
+                        raise ValueError(
+                            f"Union of multiple types {param_type} ({', '.join(type_names)}) is not supported"
+                        )
                     logger.warning(
-                        f"Union of multiple basic types {param_type} not fully supported, "
-                        f"using str as fallback. Consider using a custom converter function."
+                        f"Union type {param_type} ({', '.join(type_names)}) will use 'str' as fallback"
                     )
                     return str
                 else:
-                    # Mixed or complex union - reject with error
                     raise TypeError(
-                        f"Complex Union type {param_type} is not supported. "
-                        f"Please use a single type or provide a custom converter function."
+                        f"Complex Union type {param_type} is not supported for command-line arguments"
                     )
 
-    # Unsupported type - warn and fallback
-    logger: logging.Logger = logging.getLogger('cliframework.command')
+    type_repr = str(param_type)
+    if strict:
+        raise ValueError(
+            f"Unsupported parameter type {type_repr}"
+        )
     logger.warning(
-        f"Unsupported parameter type {param_type}, using str as fallback. "
-        f"Consider using a custom converter function for complex types."
+        f"Unsupported parameter type {type_repr}, using 'str' as fallback"
     )
     return str
+
+
+RESERVED_NAMES = {'help', 'h', '_cli_help'}
 
 
 class EnhancedArgumentParser(ArgumentParser):
@@ -319,15 +333,18 @@ class EnhancedArgumentParser(ArgumentParser):
             command_registry.set_parser_cache_invalidator(self.invalidate_command)
 
     def parse(self, args: List[str]) -> Dict[str, Any]:
-        """
-        Parse command-line arguments
-        """
+        """Parse command-line arguments"""
         if not args:
             return {'command': None}
 
         command: str = args[0]
         remaining_args: List[str] = args[1:]
         result: Dict[str, Any] = {'command': command}
+
+        # Check for help flag before argparse to avoid required argument errors
+        if '--help' in remaining_args or '-h' in remaining_args:
+            result['_cli_show_help'] = True
+            return result
 
         command_meta: Optional[Dict[str, Any]] = self._command_registry.get_command(command)
         if not command_meta:
@@ -338,24 +355,16 @@ class EnhancedArgumentParser(ArgumentParser):
         try:
             parsed_args: argparse.Namespace = parser.parse_args(remaining_args)
             result.update(vars(parsed_args))
-
-            if result.get('help', False):
-                result['show_help'] = True
-                # Remove the 'help' key to avoid leaking it to command kwargs
-                del result['help']
-
             return result
 
         except SystemExit as e:
             if e.code == 0:
-                result['show_help'] = True
-                # Clean up help flag if present
-                result.pop('help', None)
+                result['_cli_show_help'] = True
                 return result
             else:
-                help_text = parser.format_usage()
                 raise ValueError(
-                    f"Argument parsing failed for command '{command}'.\n{help_text}"
+                    f"Invalid arguments for command '{command}'.\n"
+                    f"Use '{command} --help' for detailed help."
                 )
         except Exception as e:
             self._logger.error(f"Error parsing arguments: {e}")
@@ -389,16 +398,36 @@ class EnhancedArgumentParser(ArgumentParser):
         parser.add_argument(
             '--help', '-h',
             action='store_true',
-            dest='help',
+            dest='_cli_help',
             help='Show this help message'
         )
 
-        for arg_meta in command_meta.get('arguments', []):
+        arguments = command_meta.get('arguments', [])
+        optional_count = sum(1 for arg in arguments if arg.get('optional'))
+
+        if optional_count > 1:
+            raise ValueError(
+                f"Command '{command}' has {optional_count} optional positional arguments. "
+                f"Only one optional positional argument is allowed at the end"
+            )
+
+        found_optional = False
+        for i, arg_meta in enumerate(arguments):
+            is_optional = arg_meta.get('optional', False)
+            if found_optional and not is_optional:
+                raise ValueError(
+                    f"Command '{command}': Optional positional argument '{arguments[i-1]['name']}' "
+                    f"must come after all required arguments"
+                )
+            if is_optional:
+                found_optional = True
+
+        for arg_meta in arguments:
             arg_name: str = arg_meta['name']
 
-            if arg_name in ('help', 'h'):
+            if arg_name in RESERVED_NAMES:
                 raise ValueError(
-                    f"Argument name '{arg_name}' conflicts with built-in help flag in command '{command}'"
+                    f"Argument name '{arg_name}' conflicts with reserved name in command '{command}'"
                 )
 
             arg_type: Type[Any] = validate_type(arg_meta.get('type', str))
@@ -415,10 +444,9 @@ class EnhancedArgumentParser(ArgumentParser):
             opt_name: str = opt_meta['name']
             opt_short: Optional[str] = opt_meta.get('short')
 
-            # Check for collision with help
-            if opt_name == 'help' or opt_short == 'h':
+            if opt_name in RESERVED_NAMES or (opt_short and opt_short in RESERVED_NAMES):
                 raise ValueError(
-                    f"Option '--{opt_name}' or '-{opt_short}' conflicts with built-in help flag in command '{command}'"
+                    f"Option '--{opt_name}' or '-{opt_short}' conflicts with reserved name in command '{command}'"
                 )
 
             opt_type: Type[Any] = validate_type(opt_meta.get('type', str))
@@ -434,9 +462,9 @@ class EnhancedArgumentParser(ArgumentParser):
                 if opt_default is True:
                     no_names = [f'--no-{opt_name}']
                     if opt_help and opt_help.strip():
-                        help_text = f"{opt_help} (default: enabled)"
+                        help_text = f"{opt_help} (enabled by default, use --no-{opt_name} to disable)"
                     else:
-                        help_text = argparse.SUPPRESS
+                        help_text = f"Disable {opt_name} (enabled by default)"
                     parser.add_argument(
                         *no_names,
                         action='store_false',
@@ -446,9 +474,9 @@ class EnhancedArgumentParser(ArgumentParser):
                     )
                 else:
                     if opt_help and opt_help.strip():
-                        help_text = f"{opt_help} (default: disabled)"
+                        help_text = f"{opt_help} (disabled by default)"
                     else:
-                        help_text = opt_help or f'Enable {opt_name}'
+                        help_text = f'Enable {opt_name}'
                     parser.add_argument(
                         *names,
                         action='store_true',
@@ -482,7 +510,7 @@ class EnhancedArgumentParser(ArgumentParser):
         elif type_obj is dict:
             return '(e.g., \'{"key":"val"}\' or "k1=v1,k2=v2")'
         elif type_obj is tuple:
-            return '(e.g., "x,y,z" or \'[1,2,3]\')'
+            return '(e.g., \'[1,2,3]\' for JSON)'
         return ''
 
     def _get_type_converter(self, type_obj: Type[Any]) -> Callable[[str], Any]:
@@ -492,10 +520,6 @@ class EnhancedArgumentParser(ArgumentParser):
 
         if type_obj is bool:
             def bool_converter(s: str) -> bool:
-                """
-                Convert string to boolean with explicit validation.
-                Raises ValueError for invalid values to prevent silent failures.
-                """
                 v = s.strip().lower()
                 if v in ('true', 'yes', 'y', '1', 'on'):
                     return True
@@ -552,7 +576,6 @@ class EnhancedArgumentParser(ArgumentParser):
 
         if type_obj is tuple:
             def tuple_converter(s: str) -> tuple:
-                # Only accept JSON arrays for tuple parsing
                 if s.startswith('[') and s.endswith(']'):
                     try:
                         result = json.loads(s)
@@ -564,7 +587,6 @@ class EnhancedArgumentParser(ArgumentParser):
                         self._logger.warning(f"Invalid JSON tuple format: {s}, error: {e}")
                         raise ValueError(f"Invalid JSON tuple format: {s}") from e
 
-                # Fallback to CSV for non-JSON input
                 if not s:
                     return ()
                 return tuple(item.strip() for item in s.split(',') if item.strip())
@@ -581,6 +603,12 @@ class EnhancedArgumentParser(ArgumentParser):
         parser: argparse.ArgumentParser = self._get_parser_for_command(command, command_meta)
         help_text: str = parser.format_help()
 
+        has_default_true_flags = False
+        for opt_meta in command_meta.get('options', []):
+            if opt_meta.get('is_flag') and opt_meta.get('default') is True:
+                has_default_true_flags = True
+                break
+
         has_complex_types = False
         for opt_meta in command_meta.get('options', []):
             opt_type = opt_meta.get('type', str)
@@ -588,13 +616,18 @@ class EnhancedArgumentParser(ArgumentParser):
                 has_complex_types = True
                 break
 
-        if has_complex_types:
-            help_text += "\nType Conversion:\n"
-            help_text += "  list:  JSON: '[\"a\",\"b\",\"c\"]' or CSV: 'a,b,c'\n"
-            help_text += "  dict:  JSON: '{\"k\":\"v\"}' or key=value: 'k1=v1,k2=v2'\n"
-            help_text += "  tuple: JSON: '[x,y]' or CSV: 'x,y'\n"
-            help_text += "  bool:  true/false, yes/no, y/n, 1/0, on/off\n"
-            help_text += "  Note: JSON format is validated strictly\n"
+        if has_default_true_flags or has_complex_types:
+            help_text += "\nNotes:\n"
+
+            if has_default_true_flags:
+                help_text += "  • Flags marked as 'enabled by default' use --no-<name> to disable\n"
+
+            if has_complex_types:
+                help_text += "\nType Conversion:\n"
+                help_text += "  list:  JSON: '[\"a\",\"b\"]' or CSV: 'a,b,c'\n"
+                help_text += "  dict:  JSON: '{\"k\":\"v\"}' or key=value: 'k1=v1,k2=v2'\n"
+                help_text += "  tuple: JSON: '[x,y]' (CSV not recommended)\n"
+                help_text += "  bool:  true/false, yes/no, y/n, 1/0, on/off\n"
 
         examples: List[str] = command_meta.get('examples', [])
         if examples:
