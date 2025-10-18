@@ -131,7 +131,7 @@ class CommandRegistryImpl(CommandRegistry):
         self._aliases: Dict[str, str] = {}
         self._groups: Dict[str, Dict[str, Any]] = {}
         self._trie: CommandTrie = CommandTrie()
-        self._logger: logging.Logger = logging.getLogger('cli.command_registry')
+        self._logger: logging.Logger = logging.getLogger('cliframework.command_registry')
         self._parser_cache_invalidator: Optional[Callable[[str], None]] = None
 
     def register(self, name: str, handler: Callable[..., Any], **metadata: Any) -> None:
@@ -283,7 +283,7 @@ def validate_type(param_type: Any) -> Union[Type[Any], Callable[[str], Any]]:
                 basic_types = [arg for arg in non_none_args if arg in VALID_BASIC_TYPES]
                 if len(basic_types) == len(non_none_args):
                     # All are basic types - use str as safe fallback
-                    logger = logging.getLogger('cli.command')
+                    logger = logging.getLogger('cliframework.command')
                     logger.warning(
                         f"Union of multiple basic types {param_type} not fully supported, "
                         f"using str as fallback. Consider using a custom converter function."
@@ -297,7 +297,7 @@ def validate_type(param_type: Any) -> Union[Type[Any], Callable[[str], Any]]:
                     )
 
     # Unsupported type - warn and fallback
-    logger: logging.Logger = logging.getLogger('cli.command')
+    logger: logging.Logger = logging.getLogger('cliframework.command')
     logger.warning(
         f"Unsupported parameter type {param_type}, using str as fallback. "
         f"Consider using a custom converter function for complex types."
@@ -313,7 +313,7 @@ class EnhancedArgumentParser(ArgumentParser):
         self._command_registry: CommandRegistry = command_registry
         self._max_cache_size: int = max_cache_size
         self._parser_cache: OrderedDict[str, argparse.ArgumentParser] = OrderedDict()
-        self._logger: logging.Logger = logging.getLogger('cli.argument_parser')
+        self._logger: logging.Logger = logging.getLogger('cliframework.argument_parser')
 
         if hasattr(command_registry, 'set_parser_cache_invalidator'):
             command_registry.set_parser_cache_invalidator(self.invalidate_command)
@@ -415,7 +415,7 @@ class EnhancedArgumentParser(ArgumentParser):
             opt_name: str = opt_meta['name']
             opt_short: Optional[str] = opt_meta.get('short')
 
-            # ИСПРАВЛЕНИЕ: Проверка коллизии с help
+            # Check for collision with help
             if opt_name == 'help' or opt_short == 'h':
                 raise ValueError(
                     f"Option '--{opt_name}' or '-{opt_short}' conflicts with built-in help flag in command '{command}'"

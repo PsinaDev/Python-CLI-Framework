@@ -83,7 +83,7 @@ class FileLock:
         self.stale_timeout: float = stale_timeout
         self.lock_file: Optional[Any] = None
         self.is_locked: bool = False
-        self._logger: logging.Logger = logging.getLogger('cli.config.lock')
+        self._logger: logging.Logger = logging.getLogger('cliframework.config.lock')
         self._pid: int = os.getpid()
         try:
             self._uid: int = os.getuid()
@@ -341,7 +341,7 @@ class JsonConfigProvider:
         self._schema: Optional[Dict[str, Any]] = schema
         self._lock_timeout: float = lock_timeout
         self._stale_lock_timeout: float = stale_lock_timeout
-        self._logger: logging.Logger = logging.getLogger('cli.config')
+        self._logger: logging.Logger = logging.getLogger('cliframework.config')
 
         if self._schema and not JSONSCHEMA_AVAILABLE:
             self._logger.warning("jsonschema not installed, schema validation disabled")

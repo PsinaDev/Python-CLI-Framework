@@ -35,7 +35,7 @@ class ConfigBasedMessageProvider(MessageProvider):
             raise ValueError(f"cache_size must be >= 1, got {cache_size}")
 
         self._config: ConfigProvider = config
-        self._logger: logging.Logger = logging.getLogger('cli.messages')
+        self._logger: logging.Logger = logging.getLogger('cliframework.messages')
         self._cache_size: int = cache_size
         self._message_cache: OrderedDict[str, str] = OrderedDict()
         self._cache_lock = threading.Lock()

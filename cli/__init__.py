@@ -18,7 +18,7 @@ Features:
 
 from .application import CLI, CLIError, CommandExecutionError
 from .decorators import command, argument, option, group, example
-from .output import echo, style, progress_bar, table, TerminalOutputFormatter
+from .output import style, progress_bar, table, TerminalOutputFormatter
 from .interfaces import (
     ConfigProvider, MessageProvider, OutputFormatter,
     CommandRegistry, ArgumentParser, Middleware, Hook
@@ -47,7 +47,6 @@ __all__ = [
     'example',
 
     # Output utilities
-    'echo',
     'style',
     'progress_bar',
     'table',
@@ -86,18 +85,15 @@ def _parse_version(version_str: str) -> tuple:
     Handles pre-release versions like "1.1.0b1" by stripping suffix
     """
     import re
-    # Extract only numeric parts
     match = re.match(r'^(\d+)\.(\d+)\.(\d+)', version_str)
     if match:
         return tuple(int(x) for x in match.groups())
-    # Fallback for simple versions
     parts = version_str.split('.')
     numeric_parts = []
     for part in parts:
         try:
             numeric_parts.append(int(part))
         except ValueError:
-            # Stop at first non-numeric part
             break
     return tuple(numeric_parts) if numeric_parts else (0, 0, 0)
 

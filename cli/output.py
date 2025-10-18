@@ -176,7 +176,7 @@ class TerminalOutputFormatter(OutputFormatter):
             use_colors = _supports_color()
 
         self.use_colors: bool = use_colors
-        self._logger: logging.Logger = logging.getLogger('cli.output')
+        self._logger: logging.Logger = logging.getLogger('cliframework.output')
 
         self._update_terminal_size()
 
@@ -578,22 +578,6 @@ class TerminalOutputFormatter(OutputFormatter):
 
 
 # Helper functions
-def echo(text: str, style: Optional[str] = None, file: TextIO = sys.stdout,
-         formatter: Optional[TerminalOutputFormatter] = None) -> None:
-    """
-    Print styled text to output stream
-
-    Args:
-        text: Text to print
-        style: Style name (success, error, warning, info, etc.)
-        file: Output stream (default: stdout)
-        formatter: Custom formatter instance (creates new if None)
-    """
-    if formatter is None:
-        formatter = TerminalOutputFormatter()
-    print(formatter.format(text, style), file=file)
-
-
 def style(text: str,
           fg: Optional[str] = None,
           bg: Optional[str] = None,

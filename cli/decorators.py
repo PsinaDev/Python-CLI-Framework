@@ -14,7 +14,7 @@ import threading
 import copy
 from typing import Any, Callable, Dict, List, Optional, Set, Type, TypeVar, cast
 
-_logger: logging.Logger = logging.getLogger('cli.decorators')
+_logger: logging.Logger = logging.getLogger('cliframework.decorators')
 
 F = TypeVar('F', bound=Callable[..., Any])
 

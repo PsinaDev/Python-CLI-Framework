@@ -23,7 +23,7 @@ from .interfaces import (
 )
 from .config import JsonConfigProvider
 from .messages import ConfigBasedMessageProvider
-from .output import TerminalOutputFormatter, echo
+from .output import TerminalOutputFormatter
 from .command import CommandRegistryImpl, EnhancedArgumentParser
 from .decorators import register_commands, is_async_function
 
@@ -90,32 +90,37 @@ class MiddlewarePipeline:
 
     def __init__(self):
         self._middlewares: List[Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]] = []
-        self._logger = logging.getLogger('cli.middleware')
+        self._lock = threading.Lock()
+        self._logger = logging.getLogger('cliframework.middleware')
 
     def add(self, middleware: Union[Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]],
                                    Callable[[Callable[[], Awaitable[Any]]], Any]]) -> None:
-        """Add middleware to pipeline"""
-        if asyncio.iscoroutinefunction(middleware):
-            self._middlewares.append(middleware)
-        elif callable(middleware):
-            @functools.wraps(middleware)
-            async def async_wrapper(next_handler: Callable[[], Awaitable[Any]]) -> Any:
-                result = middleware(next_handler)
-                if inspect.isawaitable(result):
-                    return await result
-                return result
-            self._middlewares.append(async_wrapper)
-        else:
-            raise TypeError("Middleware must be a callable")
+        """Add middleware to pipeline (thread-safe)"""
+        with self._lock:
+            if asyncio.iscoroutinefunction(middleware):
+                self._middlewares.append(middleware)
+            elif callable(middleware):
+                @functools.wraps(middleware)
+                async def async_wrapper(next_handler: Callable[[], Awaitable[Any]]) -> Any:
+                    result = middleware(next_handler)
+                    if inspect.isawaitable(result):
+                        return await result
+                    return result
+                self._middlewares.append(async_wrapper)
+            else:
+                raise TypeError("Middleware must be a callable")
 
     def build(self, final_handler: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:
         """
         Build middleware chain with proper closure handling
         """
+        with self._lock:
+            middlewares_snapshot = list(self._middlewares)
+
         handler = final_handler
 
         # Build chain in reverse order
-        for middleware in reversed(self._middlewares):
+        for middleware in reversed(middlewares_snapshot):
             # Create a proper wrapper that captures current middleware and handler
             def make_wrapper(mw: Callable, next_h: Callable) -> Callable[[], Awaitable[Any]]:
                 async def wrapper() -> Any:
@@ -136,26 +141,42 @@ class CommandExecutor:
         self.messages = messages
         self.output = output
         self.pipeline = pipeline
-        self._logger = logging.getLogger('cli.executor')
+        self._logger = logging.getLogger('cliframework.executor')
 
     def _suggest_similar_commands(self, command: str, max_suggestions: int = 3) -> List[str]:
         """
-        Find similar commands using Levenshtein distance
+        Find similar commands using Levenshtein distance with early exit
         """
-        def levenshtein_distance(s1: str, s2: str) -> int:
+        def levenshtein_distance(s1: str, s2: str, max_dist: int = 3) -> int:
+            """Optimized Levenshtein with early exit"""
             if len(s1) < len(s2):
-                return levenshtein_distance(s2, s1)
+                return levenshtein_distance(s2, s1, max_dist)
             if len(s2) == 0:
                 return len(s1)
+
+            # Early exit if length difference alone exceeds threshold
+            if abs(len(s1) - len(s2)) > max_dist:
+                return max_dist + 1
+
             previous_row = range(len(s2) + 1)
             for i, c1 in enumerate(s1):
                 current_row = [i + 1]
+                min_in_row = i + 1
+
                 for j, c2 in enumerate(s2):
                     insertions = previous_row[j + 1] + 1
                     deletions = current_row[j] + 1
                     substitutions = previous_row[j] + (c1 != c2)
-                    current_row.append(min(insertions, deletions, substitutions))
+                    val = min(insertions, deletions, substitutions)
+                    current_row.append(val)
+                    min_in_row = min(min_in_row, val)
+
+                # Early exit if all values in row exceed threshold
+                if min_in_row > max_dist:
+                    return max_dist + 1
+
                 previous_row = current_row
+
             return previous_row[-1]
 
         all_commands = self.commands.list_commands()
@@ -163,9 +184,19 @@ class CommandExecutor:
         command_lower = command.lower()
 
         for cmd in all_commands:
-            distance = levenshtein_distance(command_lower, cmd.lower())
-            if distance <= 3 and len(cmd) >= 3 and cmd[:2].lower() == command_lower[:2]:
+            # Skip if length difference is too large
+            if abs(len(cmd) - len(command)) > 3:
+                continue
+
+            # Skip if first 2 chars don't match (when available)
+            if len(cmd) >= 2 and len(command_lower) >= 2:
+                if cmd[:2].lower() != command_lower[:2]:
+                    continue
+
+            distance = levenshtein_distance(command_lower, cmd.lower(), max_dist=3)
+            if distance <= 3:
                 suggestions.append((distance, cmd))
+
         suggestions.sort(key=lambda x: (x[0], x[1]))
         return [cmd for _, cmd in suggestions[:max_suggestions]]
 
@@ -307,7 +338,7 @@ class InteractiveShell:
 
     def __init__(self, cli_instance: 'CLI'):
         self.cli = cli_instance
-        self._logger = logging.getLogger('cli.shell')
+        self._logger = logging.getLogger('cliframework.shell')
         self._interrupt_count = 0
 
     def setup_readline_completion(self) -> None:
@@ -486,8 +517,9 @@ class CLI:
 
     Note on generate_from:
     - Methods starting with '_' are skipped in safe_mode
-    - Only callable attributes on the class/instance are considered
-    - Instance attributes that shadow methods will be skipped
+    - Only methods defined on the class (not instance attributes) are considered
+    - Instance attributes that override methods will be ignored
+    - This ensures consistent behavior and prevents accidental exposure of data attributes
     """
 
     def __init__(self,
@@ -503,7 +535,7 @@ class CLI:
                  auto_logging_middleware: bool = False):
         """Initialize CLI application"""
         self._setup_logging(log_level)
-        self._logger: logging.Logger = logging.getLogger(f'cliframework.{name}')
+        self._logger: logging.Logger = logging.getLogger(f'cliframework.app.{name}')
         self._logger.info(f"Initializing CLI application '{name}'")
 
         self.name: str = name
@@ -717,7 +749,11 @@ class CLI:
             parts.append(f"<{arg['name']}>")
         for opt in command_meta.get('options', []):
             if opt.get('is_flag'):
-                parts.append(f"[--{opt['name']}]")
+                # If default is True, show --no-name, otherwise show --name
+                if opt.get('default') is True:
+                    parts.append(f"[--no-{opt['name']}]")
+                else:
+                    parts.append(f"[--{opt['name']}]")
             else:
                 parts.append(f"[--{opt['name']} <value>]")
         return ' '.join(parts)
@@ -819,8 +855,14 @@ class CLI:
         """
         Generate CLI commands from object (class, instance, or function)
 
-        Note: In safe_mode, only public attributes (not starting with '_') are exposed.
-        Methods that are shadowed by instance attributes will not be detected.
+        Note: In safe_mode, only public methods (not starting with '_') are exposed.
+
+        Important: This method only detects methods defined on the class itself,
+        not instance attributes. If an instance has a callable attribute that shadows
+        a class method, the method will still be registered (the instance attribute is ignored).
+        This prevents accidental exposure of data attributes and ensures consistent behavior.
+
+        To expose instance-level callables, register them explicitly via commands.register().
         """
         self._logger.debug(f"Generating CLI from {obj}")
 
@@ -839,7 +881,11 @@ class CLI:
             raise ValueError(f"Cannot generate CLI from {type(obj)}")
 
     def _generate_from_instance(self, instance: Any, safe_mode: bool) -> None:
-        """Generate commands from object instance"""
+        """
+        Generate commands from object instance
+
+        Only methods defined on the class are considered (instance attributes are ignored).
+        """
         class_name: str = instance.__class__.__name__.lower()
 
         for attr_name in dir(instance):
@@ -847,10 +893,12 @@ class CLI:
                 continue
 
             try:
+                # Get from class, not instance
                 attr_obj = getattr(type(instance), attr_name, None)
                 if attr_obj is None or not callable(attr_obj):
                     continue
 
+                # Get bound method from instance
                 attr: Any = getattr(instance, attr_name)
                 if not callable(attr):
                     continue
