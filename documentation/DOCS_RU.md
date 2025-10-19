@@ -1,5 +1,7 @@
 # CLI Framework - Документация
 
+[English](documentation/DOCS.md) | **Русский**
+
 ## Содержание
 
 - [Введение](#введение)
