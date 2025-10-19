@@ -26,8 +26,7 @@ The framework is not yet available on PyPI. To install:
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/cli-framework.git
-cd cli-framework
+git clone https://github.com/PsinaDev/Python-CLI-Framework.git
 
 # Install optional dependencies
 pip install jsonschema  # optional, for config validation
