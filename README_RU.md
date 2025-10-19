@@ -37,7 +37,7 @@ pip install jsonschema  # опционально, для валидации ко
 ## Быстрый старт
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 # Создайте экземпляр CLI
 cli = CLI(name='myapp')
@@ -93,7 +93,7 @@ python example.py
 ### Простая команда
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='greeter')
 
@@ -110,7 +110,7 @@ if __name__ == '__main__':
 ### Команда с опциями
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='filetools')
 
@@ -137,7 +137,7 @@ if __name__ == '__main__':
 ### Группы команд
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='filetools')
 
@@ -172,7 +172,7 @@ if __name__ == '__main__':
 ### Асинхронные команды
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 import asyncio
 
 cli = CLI(name='fetcher')
@@ -192,7 +192,7 @@ if __name__ == '__main__':
 ### Форматированный вывод
 
 ```python
-from cliframework import CLI, echo, table, progress_bar
+from cli import CLI, echo, table, progress_bar
 import time
 
 cli = CLI(name='demo')
@@ -229,7 +229,7 @@ if __name__ == '__main__':
 ### Middleware и Context
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 import time
 
 cli = CLI(name='myapp')
@@ -265,8 +265,8 @@ if __name__ == '__main__':
 ### Хуки жизненного цикла
 
 ```python
-from cliframework import CLI, echo
-from cliframework.interfaces import Hook
+from cli import CLI, echo
+from cli.interfaces import Hook
 
 cli = CLI(name='myapp')
 
