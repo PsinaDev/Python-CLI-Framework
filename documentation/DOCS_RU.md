@@ -1,6 +1,6 @@
 # CLI Framework - Документация
 
-[English](documentation/DOCS.md) | **Русский**
+[English](DOCS.md) | **Русский**
 
 ## Содержание
 
