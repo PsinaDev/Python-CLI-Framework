@@ -27,7 +27,7 @@
 
 ```bash
 # Клонируйте репозиторий
-git clone https://github.com/yourusername/cli-framework.git
+git clone https://github.com/PsinaDev/Python-CLI-Framework.git
 cd cli-framework
 
 # Установите опциональные зависимости
