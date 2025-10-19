@@ -1,5 +1,6 @@
 # Python CLI Framework
-Englisg | [**Русский**](README_RU.md)
+English | [**Русский**](README_RU.md)
+
 A powerful Python framework for building feature-rich command-line interfaces with declarative syntax, advanced output formatting, localization, and asynchronous support. Create professional CLIs with minimal code.
 
 ## Features
