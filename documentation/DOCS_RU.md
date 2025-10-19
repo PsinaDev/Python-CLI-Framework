@@ -60,7 +60,7 @@ pip install jsonschema  # опционально
 Создайте файл `app.py`:
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -241,7 +241,7 @@ class Database:
 Функция `echo()` выводит стилизованный текст:
 
 ```python
-from cliframework import echo
+from cli import echo
 import sys
 
 # Простой вывод
@@ -259,7 +259,7 @@ echo('Отладка', 'debug')       # Серый
 echo('Произошла ошибка!', 'error', file=sys.stderr)
 
 # Пользовательский форматтер
-from cliframework import TerminalOutputFormatter
+from cli import TerminalOutputFormatter
 formatter = TerminalOutputFormatter(use_colors=True)
 echo('Пользовательское форматирование', 'success', formatter=formatter)
 ```
@@ -271,7 +271,7 @@ echo('Пользовательское форматирование', 'success',
 Функция `style()` применяет произвольное форматирование:
 
 ```python
-from cliframework import style
+from cli import style
 
 # Цвета переднего плана
 text = style('Красный текст', fg='red')
@@ -295,7 +295,7 @@ print(text)
 Функция `table()` выводит форматированные таблицы:
 
 ```python
-from cliframework import table
+from cli import table
 import sys
 
 headers = ['Имя', 'Возраст', 'Город']
@@ -320,7 +320,7 @@ table(headers, rows, max_col_width=20)
 Функция `progress_bar()` создаёт интерактивный прогресс-бар:
 
 ```python
-from cliframework import progress_bar
+from cli import progress_bar
 import time
 import sys
 
@@ -366,7 +366,7 @@ CLI Framework предоставляет безопасное хранилище
 ### Работа с конфигурацией
 
 ```python
-from cliframework import CLI
+from cli import CLI
 
 cli = CLI(name='myapp')
 
@@ -433,7 +433,7 @@ CLI Framework поддерживает многоязычность через �
 ### Использование сообщений
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -482,7 +482,7 @@ CLI Framework полностью поддерживает асинхронные
 
 ```python
 import asyncio
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -506,7 +506,7 @@ Middleware позволяет добавлять функциональност�
 #### Базовый Middleware
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 import time
 
 cli = CLI(name='myapp')
@@ -569,8 +569,8 @@ cli.use_logging_middleware()
 Хуки позволяют расширить поведение CLI в определённых точках. Все методы хуков асинхронные.
 
 ```python
-from cliframework import CLI, echo
-from cliframework.interfaces import Hook
+from cli import CLI, echo
+from cli.interfaces import Hook
 
 cli = CLI(name='myapp')
 
@@ -653,7 +653,7 @@ cli.use(audit_middleware)
 Создавайте CLI автоматически из существующих классов:
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='filetools')
 

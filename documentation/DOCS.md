@@ -67,7 +67,7 @@ pip install jsonschema  # optional
 Create `app.py`:
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -248,7 +248,7 @@ class Database:
 The `echo()` function outputs styled text:
 
 ```python
-from cliframework import echo
+from cli import echo
 import sys
 
 # Simple output
@@ -266,7 +266,7 @@ echo('Debug', 'debug')           # Gray
 echo('Error occurred!', 'error', file=sys.stderr)
 
 # Custom formatter
-from cliframework import TerminalOutputFormatter
+from cli import TerminalOutputFormatter
 formatter = TerminalOutputFormatter(use_colors=True)
 echo('Custom formatting', 'success', formatter=formatter)
 ```
@@ -278,7 +278,7 @@ echo('Custom formatting', 'success', formatter=formatter)
 The `style()` function applies formatting and returns a styled string:
 
 ```python
-from cliframework import style
+from cli import style
 
 # Foreground colors
 text = style('Red text', fg='red')
@@ -302,7 +302,7 @@ print(text)
 The `table()` function outputs formatted tables:
 
 ```python
-from cliframework import table
+from cli import table
 import sys
 
 headers = ['Name', 'Age', 'City']
@@ -327,7 +327,7 @@ table(headers, rows, max_col_width=20)
 The `progress_bar()` function creates an interactive progress bar:
 
 ```python
-from cliframework import progress_bar
+from cli import progress_bar
 import time
 import sys
 
@@ -373,7 +373,7 @@ CLI Framework provides safe configuration storage with automatic file locking.
 ### Working with Configuration
 
 ```python
-from cliframework import CLI
+from cli import CLI
 
 cli = CLI(name='myapp')
 
@@ -440,7 +440,7 @@ CLI Framework supports multi-language applications through the message system.
 ### Using Messages
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -489,7 +489,7 @@ CLI Framework fully supports async commands:
 
 ```python
 import asyncio
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='myapp')
 
@@ -513,7 +513,7 @@ Middleware allows adding functionality to command execution. All middleware must
 #### Basic Middleware
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 import time
 
 cli = CLI(name='myapp')
@@ -576,8 +576,8 @@ This middleware logs (at DEBUG level):
 Hooks allow extending CLI behavior at specific lifecycle points. All hook methods are async.
 
 ```python
-from cliframework import CLI, echo
-from cliframework.interfaces import Hook
+from cli import CLI, echo
+from cli.interfaces import Hook
 
 cli = CLI(name='myapp')
 
@@ -668,7 +668,7 @@ The CLI context contains:
 Create CLI automatically from existing classes:
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='filetools')
 
@@ -960,7 +960,7 @@ Create progress bar. Returns update function that takes current value.
 ### Complete Example: Task Manager
 
 ```python
-from cliframework import CLI, echo, table, progress_bar
+from cli import CLI, echo, table, progress_bar
 import time
 import logging
 
@@ -1071,7 +1071,7 @@ if __name__ == '__main__':
 
 **Solution:**
 ```python
-from cliframework import TerminalOutputFormatter, CLI
+from cli import TerminalOutputFormatter, CLI
 
 cli = CLI(
     name='myapp',
