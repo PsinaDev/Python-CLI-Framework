@@ -36,7 +36,7 @@ pip install jsonschema  # optional, for config validation
 ## Quick Start
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 # Create CLI instance
 cli = CLI(name='myapp')
@@ -92,7 +92,7 @@ Full documentation is available in [DOCS.md](documentation/DOCS.md).
 ### Simple Command
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='greeter')
 
@@ -109,7 +109,7 @@ if __name__ == '__main__':
 ### Command with Options
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='filetools')
 
@@ -136,7 +136,7 @@ if __name__ == '__main__':
 ### Command Groups
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 
 cli = CLI(name='filetools')
 
@@ -170,7 +170,7 @@ if __name__ == '__main__':
 ### Async Commands
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 import asyncio
 
 cli = CLI(name='fetcher')
@@ -190,7 +190,7 @@ if __name__ == '__main__':
 ### Formatted Output
 
 ```python
-from cliframework import CLI, echo, table, progress_bar
+from cli import CLI, echo, table, progress_bar
 import time
 
 cli = CLI(name='demo')
@@ -227,7 +227,7 @@ if __name__ == '__main__':
 ### Middleware & Context
 
 ```python
-from cliframework import CLI, echo
+from cli import CLI, echo
 import time
 
 cli = CLI(name='myapp')
@@ -263,8 +263,8 @@ if __name__ == '__main__':
 ### Lifecycle Hooks
 
 ```python
-from cliframework import CLI, echo
-from cliframework.interfaces import Hook
+from cli import CLI, echo
+from cli.interfaces import Hook
 
 cli = CLI(name='myapp')
 
