@@ -1,842 +1,751 @@
-# CLI Framework - Документация
+# CLI Framework — Документация
 
-[English](DOCS.md) | **Русский**
+[**English**](DOCS.md)
+
+Python 3.10+. Опционально: `jsonschema` для валидации схемы конфига,
+`readline` (или `pyreadline3` на Windows) для tab-completion в REPL.
 
 ## Содержание
 
-- [Введение](#введение)
-- [Установка](#установка)
-- [Быстрый старт](#быстрый-старт)
-- [Основные концепции](#основные-концепции)
-- [Декораторы команд](#декораторы-команд)
-- [Форматированный вывод](#форматированный-вывод)
+- [Базовые понятия](#базовые-понятия)
+- [Декораторы](#декораторы)
+- [Вывод](#вывод)
 - [Конфигурация](#конфигурация)
 - [Локализация](#локализация)
-- [Расширенные возможности](#расширенные-возможности)
-- [API Reference](#api-reference)
-- [Примеры](#примеры)
-- [Решение проблем](#решение-проблем)
+- [Async-команды](#async-команды)
+- [Middleware](#middleware)
+- [Хуки](#хуки)
+- [CLI context](#cli-context)
+- [Cleanup-коллбэки](#cleanup-коллбэки)
+- [Интерактивный REPL](#интерактивный-repl)
+- [Shell completion](#shell-completion)
+- [Плагины](#плагины)
+- [Auto-generation](#auto-generation)
+- [Справка по API](#справка-по-api)
+- [Траблшутинг](#траблшутинг)
 
 ---
 
-## Введение
-
-**CLI Framework** — профессиональная библиотека Python для создания интерфейсов командной строки с богатым функционалом.
-
-### Ключевые особенности
-
-- **Декларативный синтаксис** через декораторы Python
-- **Автоматическая типизация** и валидация аргументов
-- **Асинхронные команды** с поддержкой `async/await`
-- **Форматированный вывод** (цвета, таблицы, прогресс-бары)
-- **Многоязычность** через систему сообщений
-- **Безопасная конфигурация** с файловыми блокировками
-- **Автогенерация CLI** из классов и функций
-- **Middleware и хуки** для расширения функциональности
-- **CLI Context** для обмена данными между middleware и командами
-- **Кроссплатформенность** (Windows, Linux, macOS)
-
-### Требования
-
-- **Python 3.8+** (использует `typing.get_origin`/`get_args` из стандартной библиотеки)
-- Опционально: `jsonschema` (для валидации конфигурации)
-
----
-
-## Установка
-
-```bash
-# Клонируйте репозиторий
-git clone https://github.com/yourusername/cli-framework.git
-
-# Установите опциональные зависимости
-pip install jsonschema  # опционально
-```
-
----
-
-## Быстрый старт
-
-Создайте файл `app.py`:
-
-```python
-from cli import CLI, echo
-
-cli = CLI(name='myapp')
-
-@cli.command()
-@cli.argument('name', help='Имя для приветствия')
-@cli.option('--greeting', '-g', default='Привет', help='Текст приветствия')
-def greet(name, greeting):
-    """Поприветствовать пользователя"""
-    echo(f"{greeting}, {name}!", 'success')
-
-if __name__ == '__main__':
-    cli.run()
-```
-
-Запустите приложение:
-
-```bash
-# Вызов команды
-python app.py greet Мир --greeting="Здравствуй"
-# Выведет: Здравствуй, Мир!
-
-# Справка
-python app.py help greet
-
-# Интерактивный режим
-python app.py
-```
-
----
-
-## Основные концепции
-
-### Структура команды
-
-Команда состоит из:
-- **Имя** — уникальный идентификатор команды
-- **Обработчик** — функция, выполняющая логику команды
-- **Аргументы** — обязательные позиционные параметры
-- **Опции** — необязательные именованные параметры
-- **Справка** — описание команды и её параметров
-- **Примеры** — примеры использования
-
-### Зарезервированные имена
-
-Следующие имена зарезервированы и не могут использоваться для аргументов, опций или команд:
-- `help`, `h` — зарезервированы для флага справки
-- `_cli_help`, `_cli_show_help` — внутренняя обработка справки
-
-Использование зарезервированных имён вызовет чёткую ошибку при регистрации команды.
+## Базовые понятия
 
 ### Жизненный цикл команды
 
-1. **Парсинг** — CLI парсит аргументы командной строки
-2. **Валидация** — проверка типов и обязательных параметров
-3. **Хуки: Before Parse** — модификация аргументов перед парсингом
-4. **Хуки: After Parse** — модификация результатов парсинга
-5. **Настройка контекста** — заполнение CLI context
-6. **Хуки: Before Execute** — логика перед выполнением
-7. **Цепочка Middleware** — выполнение middleware в порядке регистрации
-8. **Выполнение** — вызов обработчика команды
-9. **Хуки: After Execute** — логика после выполнения
-10. **Обработка результата** — возврат кода завершения
-11. **Очистка** — выполнение cleanup callbacks
+```
+sys.argv ──► run() ──► run_async()
+                       │
+                       ├─ извлечение --config-file (если есть), смена провайдера
+                       ├─ Hook.on_before_parse(args)
+                       ├─ parser.parse(args)
+                       ├─ Hook.on_after_parse(parsed)
+                       └─ executor.execute(command, **kwargs)
+                            │
+                            ├─ middleware-цепочка (внешние → внутренние)
+                            ├─ Hook.on_before_execute  +  per-command before
+                            ├─ handler(**kwargs)
+                            ├─ Hook.on_after_execute   +  per-command after
+                            └─ unwind middleware
+                       │
+                       └─ cleanup-коллбэки (sync или async, таймаут 5 с на каждый)
+```
+
+`cli.run()` — синхронная точка входа, внутри `asyncio.run(run_async)`.
+Sync-обработчики вызываются напрямую; async-обработчики await-ятся.
+
+### Зарезервированные имена
+
+```
+help, h, _cli_help, _cli_show_help
+```
+
+Экспортируются как `cli.RESERVED_NAMES`. Использование их для команд,
+алиасов, опций, коротких флагов или параметров функции вызывает
+`ValueError` на этапе декорирования.
+
+Передача `-h` или `--help` после имени любой зарегистрированной команды
+коротит парсер и печатает help этой команды вместо вызова handler-а:
+
+```bash
+python app.py greet --help
+python app.py greet -h
+```
+
+### Порядок декораторов
+
+Python применяет декораторы снизу вверх — **первый** в списке
+`@cli.argument` пушится в список аргументов **последним**. Чтобы
+позиционный порядок совпал с сигнатурой функции, аргументы перечисляются
+в обратном порядке:
+
+```python
+@cli.command()
+@cli.argument("b", type=int)
+@cli.argument("a", type=int)
+def add(a: int, b: int) -> int: ...
+```
+
+Порядок `@cli.option` влияет только на отображение в help — при парсинге
+опции ищутся по имени.
+
+### Default- и per-CLI-реестры
+
+Два способа регистрации команд:
+
+1. **Module-level** декораторы (`from cli import command, argument, option`)
+   пишут в process-wide default registry. Любой созданный позже CLI
+   подхватывает их, если не передать `include_default_registry=False`.
+2. **Bound** декораторы конкретного экземпляра (`cli.command()`,
+   `cli.argument()`, …) пишут только в приватный реестр этого CLI.
+   Несколько `CLI`-экземпляров в одном процессе не конфликтуют.
+
+`BoundDecorators(registry)` позволяет привязать декораторы к
+произвольному реестру явно.
 
 ---
 
-## Декораторы команд
+## Декораторы
 
-### @command
-
-Определяет команду:
+### `@cli.command`
 
 ```python
-@cli.command(name='hello', help='Сказать привет', aliases=['hi', 'greet'])
-def hello_command():
-    echo('Привет, мир!', 'info')
-```
-
-**Параметры:**
-- `name` (str, optional) — имя команды (по умолчанию — имя функции)
-- `help` (str, optional) — описание команды (по умолчанию — docstring)
-- `aliases` (List[str], optional) — альтернативные имена команды
-
-### @argument
-
-Добавляет позиционный аргумент:
-
-```python
-@cli.command()
-@cli.argument('filename', help='Путь к файлу', type=str)
-@cli.argument('count', help='Количество строк', type=int)
-@cli.argument('output', help='Выходной файл', type=str, optional=True)
-def process(filename, count, output=None):
-    echo(f'Обработка {filename}, строк: {count}')
-    if output:
-        echo(f'Вывод в: {output}')
-```
-
-**Параметры:**
-- `name` (str) — имя аргумента
-- `help` (str, optional) — описание аргумента
-- `type` (Type, optional) — тип аргумента (по умолчанию `str`)
-- `optional` (bool, optional) — является ли аргумент опциональным (по умолчанию `False`)
-
-**Важно:** Разрешён только один опциональный позиционный аргумент, и он должен быть последним.
-
-**Поддерживаемые типы:** `str`, `int`, `float`, `bool`, `list`, `dict`, `tuple`
-
-### @option
-
-Добавляет именованную опцию:
-
-```python
-@cli.command()
-@cli.option('--verbose', '-v', is_flag=True, help='Подробный вывод')
-@cli.option('--output', '-o', type=str, default='output.txt', help='Выходной файл')
-@cli.option('--count', '-c', type=int, default=1, help='Количество повторений')
-def process(verbose, output, count):
-    if verbose:
-        echo(f'Вывод в {output}, повторов: {count}', 'info')
-```
-
-**Параметры:**
-- `name` (str) — имя опции (с `--` или без)
-- `short` (str, optional) — короткое имя (с `-` или без)
-- `help` (str, optional) — описание опции
-- `type` (Type, optional) — тип опции (по умолчанию `str`)
-- `default` (Any, optional) — значение по умолчанию
-- `is_flag` (bool, optional) — булев флаг (True/False)
-
-**Флаги с default=True:** Используйте `--no-<имя>` для отключения (например, `--no-verbose`)
-
-### @example
-
-Добавляет пример использования:
-
-```python
-@cli.command()
-@cli.argument('source', help='Исходный файл')
-@cli.argument('dest', help='Целевой файл')
-@cli.option('--force', '-f', is_flag=True, help='Принудительная перезапись')
-@cli.example('copy input.txt output.txt')
-@cli.example('copy data.json backup.json --force')
-def copy(source, dest, force):
-    echo(f'Копирование {source} -> {dest}')
-```
-
-### @group
-
-Создаёт группу команд из класса:
-
-```python
-@cli.group(name='database', help='Команды для работы с БД')
-class Database:
-    @cli.command()
-    def init(self):
-        """Инициализировать базу данных"""
-        echo('Инициализация БД...', 'info')
-    
-    @cli.command()
-    @cli.option('--dry-run', is_flag=True, help='Тестовый запуск')
-    def migrate(self, dry_run):
-        """Запустить миграции"""
-        if dry_run:
-            echo('Тестовый режим миграций', 'warning')
-        else:
-            echo('Запуск миграций...', 'info')
-
-# Команды доступны как: database.init, database.migrate
-```
-
----
-
-## Форматированный вывод
-
-### Функция echo()
-
-Функция `echo()` выводит стилизованный текст:
-
-```python
-from cli import echo
-import sys
-
-# Простой вывод
-echo('Привет, мир!')
-
-# Предопределённые стили
-echo('Успех!', 'success')      # Зелёный
-echo('Внимание!', 'warning')   # Жёлтый
-echo('Ошибка!', 'error')       # Красный
-echo('Информация', 'info')     # Синий
-echo('Заголовок', 'header')    # Жирный белый
-echo('Отладка', 'debug')       # Серый
-
-# Вывод в stderr
-echo('Произошла ошибка!', 'error', file=sys.stderr)
-
-# Пользовательский форматтер
-from cli import TerminalOutputFormatter
-formatter = TerminalOutputFormatter(use_colors=True)
-echo('Пользовательское форматирование', 'success', formatter=formatter)
-```
-
-**Доступные стили:** `success`, `error`, `warning`, `info`, `header`, `debug`, `emphasis`, `code`, `highlight`
-
-### Кастомное форматирование
-
-Функция `style()` применяет произвольное форматирование:
-
-```python
-from cli import style
-
-# Цвета переднего плана
-text = style('Красный текст', fg='red')
-text = style('Яркий синий', fg='bright_blue')
-
-# Цвета фона
-text = style('Текст на жёлтом фоне', fg='black', bg='yellow')
-
-# Стили текста
-text = style('Жирный', bold=True)
-text = style('Подчёркнутый', underline=True)
-text = style('Жирный красный', fg='red', bold=True)
-
-print(text)
-```
-
-**Доступные цвета:** `black`, `red`, `green`, `yellow`, `blue`, `magenta`, `cyan`, `white`, `bright_*` (варианты)
-
-### Таблицы
-
-Функция `table()` выводит форматированные таблицы:
-
-```python
-from cli import table
-import sys
-
-headers = ['Имя', 'Возраст', 'Город']
-rows = [
-    ['Алексей', '28', 'Москва'],
-    ['Мария', '32', 'Санкт-Петербург'],
-    ['Иван', '25', 'Новосибирск']
-]
-
-# Вывод в stdout (по умолчанию)
-table(headers, rows)
-
-# Вывод в stderr
-table(headers, rows, file=sys.stderr)
-
-# С указанной шириной колонок
-table(headers, rows, max_col_width=20)
-```
-
-### Индикаторы прогресса
-
-Функция `progress_bar()` создаёт интерактивный прогресс-бар:
-
-```python
-from cli import progress_bar
-import time
-import sys
-
-total = 100
-
-# Базовое использование
-update = progress_bar(total)
-for i in range(total + 1):
-    update(i)
-    time.sleep(0.02)
-
-# Расширенное использование
-update = progress_bar(
-    total,
-    width=50,                    # Ширина бара
-    char='█',                    # Символ заполнения
-    empty_char='·',              # Символ пустоты
-    show_percent=True,           # Показать процент
-    show_count=True,             # Показать счётчик (текущий/всего)
-    prefix='Загрузка:',          # Текст перед баром
-    suffix='завершено',          # Текст после бара
-    color_low='yellow',          # Цвет для 0-33%
-    color_mid='blue',            # Цвет для 33-66%
-    color_high='green',          # Цвет для 66-100%
-    brackets=('[', ']'),         # Символы скобок
-    file=sys.stdout,             # Поток вывода
-    force_inline=None            # Принудительное inline обновление (None=автоопределение)
+cli.command(
+    name: str | None = None,
+    help: str | None = None,
+    aliases: list[str] | None = None,
 )
-
-for i in range(total + 1):
-    update(i)
-    time.sleep(0.02)
 ```
 
-**Поддержка потоков:** Все функции вывода (`echo`, `table`, `progress_bar`) поддерживают пользовательские потоки через параметр `file`.
+`name` по умолчанию — имя функции; `help` перекрывает первую строку
+docstring; `aliases` добавляет альтернативные имена.
+
+### `@cli.argument`
+
+```python
+cli.argument(
+    name: str,
+    help: str | None = None,
+    type: type = str,
+    optional: bool = False,
+    group: str | None = None,
+)
+```
+
+Поддерживаемые `type`: `str`, `int`, `float`, `bool`, `list`, `dict`,
+`tuple`, наследники `Enum`, `Optional[T]`. `list` и `dict` принимают
+JSON или упрощённый синтаксис `key=value` / CSV в командной строке.
+
+`optional=True` делает позиционный аргумент опциональным; такой аргумент
+обязан идти последним. `group` — display-only метка.
+
+### `@cli.option`
+
+```python
+cli.option(
+    name: str,
+    short: str | None = None,
+    help: str | None = None,
+    type: type = str,
+    default: Any = ...,            # обязателен, если нет default_factory
+    default_factory: Callable[[], Any] | None = None,
+    is_flag: bool | None = None,   # автоопределение по типу
+    group: str | None = None,
+    exclusive_group: str | None = None,
+)
+```
+
+- `name` принимает `"--verbose"` или `"verbose"`; `short` — `"-v"` или `"v"` (один символ).
+- `is_flag` автоматически становится `True` для `bool`-типа или `bool`-default.
+- `default_factory` создаёт свежее значение на каждый парс — нужно для дефолтов-`list`/`dict`, чтобы они не шарились между запусками.
+- `exclusive_group`: опции с одинаковой меткой становятся взаимоисключающими на уровне парсера.
+
+```python
+@cli.option("--verbose", "-v", is_flag=True)
+@cli.option("--retries", "-r", type=int, default=3)
+@cli.option("--mode", default="dev", exclusive_group="mode")
+@cli.option("--prod", is_flag=True, exclusive_group="mode")
+```
+
+### `@cli.example`
+
+```python
+cli.example(example_text: str)
+```
+
+Добавляет пример использования в help команды. Стекается.
+
+### `@cli.group`
+
+```python
+cli.group(name: str | None = None, help: str | None = None)
+```
+
+Декоратор класса. Методы класса, помеченные `@cli.command`, становятся
+точечными командами в namespace группы.
+
+Класс инстанцируется **один раз** на регистрацию CLI без аргументов —
+либо предоставьте `__init__` без обязательных параметров (или вообще
+без него), либо опирайтесь на module-level state, если нужно
+персистировать данные:
+
+```python
+@cli.group(name="users")
+class UserCommands:
+    def __init__(self) -> None:
+        self._store: dict[str, str] = {}
+
+    @cli.command()
+    @cli.argument("username")
+    def add(self, username: str) -> int:
+        self._store[username] = "user"
+        return 0
+```
+
+---
+
+## Вывод
+
+### `echo`
+
+```python
+echo(
+    text: str,
+    style: str | None = None,
+    file: TextIO = sys.stdout,
+    formatter: TerminalOutputFormatter | None = None,
+) -> None
+```
+
+Имена стилей: `success`, `error`, `warning`, `info`, `header`, `debug`,
+`code`. `None` — нестилизованный вывод.
+
+### `style`
+
+```python
+style(
+    text: str,
+    fg: str | None = None,
+    bg: str | None = None,
+    bold: bool = False,
+    underline: bool = False,
+    blink: bool = False,
+    formatter: TerminalOutputFormatter | None = None,
+) -> str
+```
+
+Возвращает строку, обёрнутую ANSI-последовательностями. Поддерживает 8
+стандартных цветов и `bright_*` варианты.
+
+### `table`
+
+```python
+table(
+    headers: list[str],
+    rows: list[list[str]],
+    max_col_width: int | None = None,
+    file: TextIO = sys.stdout,
+    formatter: TerminalOutputFormatter | None = None,
+) -> None
+```
+
+Авторазмерная таблица с box-drawing символами; ANSI-коды внутри ячеек
+учитываются при измерении ширины.
+
+### `progress_bar`
+
+```python
+progress_bar(
+    total: int,
+    width: int | None = None,
+    char: str = "█",
+    empty_char: str = "·",
+    show_percent: bool = True,
+    show_count: bool = True,
+    prefix: str = "",
+    suffix: str = "",
+    color_low: str = "yellow",
+    color_mid: str = "blue",
+    color_high: str = "green",
+    color_threshold_low: float = 0.33,
+    color_threshold_high: float = 0.66,
+    brackets: tuple[str, str] = ("[", "]"),
+    file: TextIO = sys.stdout,
+    force_inline: bool | None = None,
+    formatter: TerminalOutputFormatter | None = None,
+) -> Callable[[int], None]
+```
+
+Возвращает `update(current)`. Если `file` — не TTY и `force_inline=None`,
+вывод переключается на одну строку на обновление.
 
 ---
 
 ## Конфигурация
 
-CLI Framework предоставляет безопасное хранилище конфигурации с автоматическими блокировками.
-
-### Работа с конфигурацией
+### `JsonConfigProvider`
 
 ```python
-from cli import CLI
-
-cli = CLI(name='myapp')
-
-# Сохранение значений
-cli.config.set('app.name', 'My Application')
-cli.config.set('app.version', '1.0.0')
-cli.config.set('database.host', 'localhost')
-cli.config.set('database.port', 5432)
-cli.config.save()
-
-# Чтение значений
-app_name = cli.config.get('app.name', 'Default')
-db_host = cli.config.get('database.host', 'localhost')
-
-# Получение всей конфигурации
-config_dict = cli.config.get_all()
+JsonConfigProvider(
+    path: str,
+    default_config: dict[str, Any] | None = None,
+    schema: dict[str, Any] | None = None,
+)
 ```
 
-### Обновление конфигурации
+Thread-safe JSON-хранилище с file lock. Методы интерфейса
+`ConfigProvider`:
 
-**Метод 1: Использование set() для иерархических ключей (рекомендуется)**
+- `get(key, default=None)` — иерархический доступ через точку
+- `set(key, value)` — пишет в in-memory копию
+- `update(mapping)` — deep merge
+- `delete(key)` — удалить лист
+- `save()` — атомарная запись на диск
+- `get_all()` — полный snapshot
+
+### Иерархические ключи
+
 ```python
-cli.config.set('app.theme', 'dark')
-cli.config.set('app.language', 'ru')
+cli.config.set("database.host", "localhost")
+cli.config.set("database.port", 5432)
+cli.config.update({"app": {"theme": "dark", "language": "en"}})
+host = cli.config.get("database.host")
 cli.config.save()
 ```
 
-**Метод 2: Использование update() с вложенными словарями**
-```python
-# Правильно: вложенная структура
-cli.config.update({
-    'app': {
-        'theme': 'dark',
-        'language': 'ru'
-    }
-})
-cli.config.save()
+### Валидация схемой
 
-# НЕПРАВИЛЬНО: плоские ключи с точками
-# cli.config.update({'app.theme': 'dark'})  # Создаст буквальный ключ 'app.theme'
-```
-
-### Иерархический доступ
-
-Конфигурация поддерживает доступ через точки для вложенных структур:
+Если установлен `jsonschema` и передана `schema`, каждая загрузка и
+запись валидируется против неё. Фреймворк поставляет
+`DEFAULT_CONFIG_SCHEMA`, покрывающую поля локализации, которые он сам
+использует:
 
 ```python
-# Установка вложенных значений
-cli.config.set('server.database.credentials.username', 'admin')
-cli.config.set('server.database.credentials.password', 'secret')
+from cli import DEFAULT_CONFIG_SCHEMA, JsonConfigProvider
 
-# Чтение вложенных значений
-username = cli.config.get('server.database.credentials.username')
+provider = JsonConfigProvider(
+    "myapp.json",
+    default_config={"version": "1.0.0",
+                    "default_language": "en", "languages": ["en"]},
+    schema=DEFAULT_CONFIG_SCHEMA,
+)
 ```
 
-**Примечание:** Чувствительные ключи (содержащие 'password', 'token', 'secret' и т.д.) автоматически маскируются в логах.
+Ошибки: `ConfigError`, `ConfigValidationError`, `ConfigIOError`,
+`ConfigLockError`. `sanitize_for_logging(value)` вырезает поля,
+похожие на секреты, перед логированием.
+
+### `EnvOverlayConfigProvider`
+
+```python
+EnvOverlayConfigProvider(
+    inner: ConfigProvider,
+    prefix: str,
+    separator: str = "__",
+)
+```
+
+Read-overlay переменных окружения поверх любого внутреннего провайдера:
+
+```
+APP_FOO=bar              -> foo = "bar"
+APP_DATABASE__HOST=db    -> database.host = "db"
+APP_TIMEOUT=30           -> timeout = 30          (распарсится как int)
+APP_FEATURES='["a","b"]' -> features = ["a","b"]  (распарсится как JSON)
+```
+
+Значения сначала пытаются распарситься как JSON; при ошибке —
+возвращаются как сырые строки. `set()`, `delete()`, `save()`
+проксируются во внутренний провайдер — overlay сам по себе read-only.
+После мутации `os.environ` нужно вызвать `refresh()` для перечитки.
+
+### Флаг `--config-file`
+
+Любой CLI на этом фреймворке принимает `--config-file PATH` перед
+именем команды. Провайдер подменяется до начала парсинга:
+
+```bash
+python myapp.py --config-file /etc/myapp/prod.json deploy
+```
 
 ---
 
 ## Локализация
 
-CLI Framework поддерживает многоязычность через систему сообщений.
-
-### Использование сообщений
-
-```python
-from cli import CLI, echo
-
-cli = CLI(name='myapp')
-
-@cli.command()
-@cli.argument('name', help='Имя пользователя')
-def greet(name):
-    """Поприветствовать пользователя"""
-    message = cli.messages.get_message(
-        'greeting',
-        default='Hello, {name}!',
-        name=name
-    )
-    echo(message, 'success')
-```
-
-**Примечание:** Кэш сообщений теперь правильно обрабатывает параметр `default`, гарантируя, что разные defaults для одного ключа не вернут закэшированное неверное значение.
-
-### Добавление языков
+`ConfigBasedMessageProvider` читает строки из
+`config["messages"][<lang>][<key>]`:
 
 ```python
-# Добавление русского языка
-ru_messages = {
-    'greeting': 'Привет, {name}!',
-    'goodbye': 'До свидания!',
-}
-
-cli.messages.add_language('ru', ru_messages)
-
-# Переключение языка
-cli.messages.set_language('ru')
-
-# Удаление языка (сохраняет сообщения по умолчанию)
-cli.messages.remove_language('ru', purge=False)
-
-# Удаление языка и сообщений
-cli.messages.remove_language('ru', purge=True)
+cli.messages.get_message("greeting", default="Hello, {name}!", name="Alice")
+cli.messages.set_language("ru")
+cli.messages.get_current_language()
+cli.messages.get_available_languages()
 ```
+
+Чтобы добавить язык, пишем в конфиг и сохраняем:
+
+```python
+cli.config.update({
+    "messages": {
+        "ru": {"prompt": "приложение> ", "app_quit": "Выход."}
+    }
+})
+cli.config.save()
+cli.messages.set_language("ru")
+```
+
+Плейсхолдеры формата подставляются через safe formatter, который
+игнорирует отсутствующие ключи вместо исключения. Ошибки: `MessageError`.
 
 ---
 
-## Расширенные возможности
-
-### Асинхронные команды
-
-CLI Framework полностью поддерживает асинхронные команды:
+## Async-команды
 
 ```python
 import asyncio
-from cli import CLI, echo
-
-cli = CLI(name='myapp')
 
 @cli.command()
-@cli.argument('url', help='URL для загрузки')
-async def download(url):
-    """Асинхронная загрузка данных"""
-    echo(f'Загрузка {url}...', 'info')
-    await asyncio.sleep(2)
-    echo('Загрузка завершена!', 'success')
+@cli.argument("url")
+async def fetch(url: str) -> int:
+    await asyncio.sleep(0.5)
     return 0
-
-if __name__ == '__main__':
-    cli.run()
 ```
 
-### Middleware
+Executor всегда работает через `asyncio.run` на верхнем уровне.
+Sync-обработчики вызываются напрямую без оффлоада в поток.
 
-Middleware позволяет добавлять функциональность к выполнению команд. Весь middleware должен быть асинхронными функциями.
+---
 
-#### Базовый Middleware
+## Middleware
 
 ```python
-from cli import CLI, echo
-import time
+from typing import Any, Awaitable, Callable
 
-cli = CLI(name='myapp')
+async def middleware(next_handler: Callable[[], Awaitable[Any]]) -> Any:
+    # before
+    try:
+        return await next_handler()
+    finally:
+        # after / on error
+        ...
 
-# Middleware для измерения времени
-async def timing_middleware(next_handler):
-    start = time.time()
-    result = await next_handler()
-    elapsed = time.time() - start
-    echo(f'Выполнено за {elapsed:.2f}s', 'debug')
-    return result
-
-# Middleware для логирования
-async def logging_middleware(next_handler):
-    echo('→ Начало выполнения команды', 'debug')
-    result = await next_handler()
-    echo('← Команда завершена', 'debug')
-    return result
-
-# Регистрация middleware (выполняются в порядке регистрации)
-cli.use(logging_middleware)
-cli.use(timing_middleware)
-
-@cli.command()
-def hello():
-    """Тестовая команда"""
-    echo('Привет, мир!', 'info')
-    time.sleep(1)
-
-if __name__ == '__main__':
-    cli.run()
+cli.use(middleware)
 ```
 
-**Важно:** Поддерживается только асинхронный middleware. Синхронный middleware не может правильно реализовать around-паттерн, требуемый фреймворком.
+Только async middleware принимаются (`TypeError` иначе). Цепочка
+вызывается в порядке регистрации вокруг handler-а:
 
-#### Встроенное Logging Middleware
-
-CLI Framework предоставляет встроенное middleware для отладки:
-
-**Способ 1: Включить при инициализации**
-```python
-import logging
-cli = CLI(name='myapp', auto_logging_middleware=True, log_level=logging.DEBUG)
+```
+cli.use(a); cli.use(b)
+# вызов: a → b → handler → b unwind → a unwind
 ```
 
-**Способ 2: Добавить вручную**
+`cli.use_logging_middleware()` регистрирует встроенный tracer,
+использующий логгер фреймворка.
+
+Множество `bypass_middleware` исполнителя (`{"help", "version", "exit"}`
+по умолчанию) пропускает цепочку для этих команд.
+
+---
+
+## Хуки
+
+### Глобальный интерфейс `Hook`
+
+Наследуйте `Hook` и переопределяйте только нужные фазы. Все пять — no-op
+по умолчанию.
+
 ```python
-import logging
-cli = CLI(name='myapp', log_level=logging.DEBUG)
-cli.use_logging_middleware()
-```
+from cli import Hook
 
-Это middleware логирует (на уровне DEBUG):
-- Имя команды и аргументы перед выполнением
-- Результат выполнения после завершения
-- Ошибки выполнения
-
-### Хуки жизненного цикла
-
-Хуки позволяют расширить поведение CLI в определённых точках. Все методы хуков асинхронные.
-
-```python
-from cli import CLI, echo
-from cli.interfaces import Hook
-
-cli = CLI(name='myapp')
-
-class LoggingHook(Hook):
-    async def on_before_parse(self, args):
-        echo(f'Парсинг: {args}', 'debug')
+class AuditHook(Hook):
+    async def on_before_parse(self, args: list[str]) -> list[str]:
         return args
-    
-    async def on_after_parse(self, parsed):
-        echo(f'Распарсено: {parsed}', 'debug')
+    async def on_after_parse(self, parsed: dict[str, Any]) -> dict[str, Any]:
         return parsed
-    
-    async def on_before_execute(self, command, kwargs):
-        echo(f'Выполнение: {command}({kwargs})', 'debug')
-    
-    async def on_after_execute(self, command, result, exit_code):
-        echo(f'Завершено: {command} -> {exit_code}', 'debug')
-    
-    async def on_error(self, command, error):
-        echo(f'Ошибка в {command}: {error}', 'error')
+    async def on_before_execute(self, command: str, kwargs: dict[str, Any]) -> None: ...
+    async def on_after_execute(self, command: str, result: Any, exit_code: int) -> None: ...
+    async def on_error(self, command: str, error: BaseException) -> None: ...
 
-cli.add_hook(LoggingHook())
+cli.add_hook(AuditHook())
 ```
 
-### CLI Context
+`on_before_parse` и `on_after_parse` могут вернуть изменённые данные,
+чтобы повлиять на последующие этапы пайплайна. Исключения в любом
+глобальном хуке ловятся и логируются — выполнение не прерывается.
 
-CLI Context позволяет обмениваться данными между middleware и командами.
-
-#### Доступ к контексту в Middleware
+### Per-command хуки
 
 ```python
-async def context_aware_middleware(next_handler):
-    # Получить контекст выполнения
-    ctx = cli.get_context()
-    command = ctx.get('command')           # имя команды
-    args = ctx.get('args', {})             # аргументы команды
-    cli_instance = ctx.get('cli_instance') # экземпляр CLI
-    
-    echo(f"[{command}] Выполнение с: {args}", 'debug')
-    
-    result = await next_handler()
-    return result
+@cli.before("ping")
+async def _before(kwargs: dict[str, Any]) -> None: ...
 
-cli.use(context_aware_middleware)
+@cli.after("ping")
+async def _after(result: Any, exit_code: int) -> None: ...
+
+@cli.on_error_for("boom")
+async def _on_error(error: BaseException) -> None: ...
 ```
 
-#### Установка пользовательских данных
-
-```python
-async def auth_middleware(next_handler):
-    # Установить данные в контекст
-    cli.set_context(
-        user_id=123,
-        role='admin',
-        timestamp=time.time()
-    )
-    
-    result = await next_handler()
-    return result
-
-async def audit_middleware(next_handler):
-    # Прочитать данные из контекста
-    ctx = cli.get_context()
-    user_id = ctx.get('user_id', 'anonymous')
-    command = ctx.get('command', 'unknown')
-    
-    echo(f"Пользователь {user_id} выполняет '{command}'", 'debug')
-    
-    result = await next_handler()
-    return result
-
-cli.use(auth_middleware)
-cli.use(audit_middleware)
-```
-
-**Примечание:** Контекст доступен только во время выполнения команды (в middleware). Он недоступен напрямую в обработчиках команд. Для доступа к данным контекста в командах сохраните их в переменных уровня модуля или класса из middleware.
-
-### Автогенерация CLI
-
-Создавайте CLI автоматически из существующих классов:
-
-```python
-from cli import CLI, echo
-
-cli = CLI(name='filetools')
-
-class FileManager:
-    def list(self, path='.', show_hidden=False):
-        """Вывести список файлов"""
-        import os
-        for item in os.listdir(path):
-            if not show_hidden and item.startswith('.'):
-                continue
-            echo(item)
-    
-    def info(self, filepath):
-        """Показать информацию о файле"""
-        import os
-        stats = os.stat(filepath)
-        echo(f'Размер: {stats.st_size} байт')
-
-# Автоматическая генерация команд
-cli.generate_from(FileManager)
-
-# Команды: filemanager.list, filemanager.info
-```
-
-**Безопасный режим (по умолчанию):** Доступны только публичные методы (не начинающиеся с `_`).
-
-### Callback при завершении
-
-Регистрируйте функции очистки:
-
-```python
-cli = CLI(name='myapp')
-
-# Синхронная очистка
-def cleanup():
-    echo('Очистка ресурсов...', 'info')
-
-cli.add_cleanup_callback(cleanup)
-
-# Асинхронная очистка
-async def async_cleanup():
-    echo('Асинхронная очистка...', 'info')
-    await asyncio.sleep(0.1)
-
-cli.add_cleanup_callback(async_cleanup)
-```
-
-**Вызываются при:**
-- Нормальном выходе
-- Ctrl+C (graceful shutdown)
-- Исключении
-
-**Примечание:** Экстренная очистка (force exit) выполняет только синхронные callbacks.
-
-### Интерактивный режим (REPL)
-
-```python
-cli = CLI(name='myapp')
-
-@cli.command()
-def status():
-    """Показать статус"""
-    echo('Всё работает!', 'success')
-
-if __name__ == '__main__':
-    cli.run(interactive=True)
-```
-
-**Tab completion:** Включён по умолчанию. Для Windows: `pip install pyreadline3`
+Сигнатуры per-command хуков **не** содержат имя команды (в отличие от
+методов глобального `Hook`). Их исключения тоже логируются и не
+прерывают выполнение, поэтому валидацию входов делайте внутри handler-а
+с возвратом ненулевого exit code.
 
 ---
 
-## API Reference (краткий)
+## CLI context
 
-### CLI
+`ContextVar`, который executor наполняет на время выполнения команды.
+Доступен из middleware и из handler-а:
 
 ```python
-CLI(name, config_path=None, log_level=logging.INFO, auto_logging_middleware=False, ...)
+ctx = cli.get_context()
+# {
+#   "command":      "greet",
+#   "args":         {"name": "Alice"},
+#   "cli_instance": <CLI ...>,
+# }
+
+cli.set_context(user_id=42, request_id="abc-123")
 ```
 
-**Методы:**
-- `command()`, `argument()`, `option()`, `example()`, `group()` — декораторы
-- `use(middleware)` — добавить async middleware
-- `add_hook(hook)` — добавить хук жизненного цикла
-- `get_context()` / `set_context(**kwargs)` — работа с контекстом
-- `add_cleanup_callback()` — регистрация cleanup
-- `run()`, `run_async()`, `run_interactive()` — запуск
+Обновления мержатся в существующий dict.
 
-### Функции вывода
+---
+
+## Cleanup-коллбэки
 
 ```python
-echo(text, style=None, file=sys.stdout, formatter=None)
-style(text, fg=None, bg=None, bold=False, underline=False, ...)
-table(headers, rows, max_col_width=None, file=sys.stdout, formatter=None)
-progress_bar(total, width=None, char='█', file=sys.stdout, ...) -> Callable[[int], None]
+def flush() -> None: ...
+async def close_db() -> None: ...
+
+cli.add_cleanup_callback(flush)
+cli.add_cleanup_callback(close_db)
+```
+
+Запускаются после возврата из `run_async` (успех или ошибка) перед
+завершением процесса. На каждый коллбэк — таймаут 5 секунд; таймауты и
+исключения логируются, но не останавливают остальные. На второй
+`SIGINT`/`SIGTERM` синхронные коллбэки запускаются по emergency-пути
+перед `os._exit(1)`.
+
+---
+
+## Интерактивный REPL
+
+`cli.run()` без аргументов автоматически входит в REPL. Возможности:
+
+- история и tab-completion на readline (длинные опции + имена команд через prefix trie)
+- встроенные `help`, `version`, `exit` / `quit` / `q`
+- одно `Ctrl+C` отменяет ввод текущей строки; второе в течение ~2 с — выход
+- fuzzy-suggest "did you mean ..." для неизвестных команд (Levenshtein ≤ 2)
+
+```python
+cli.enable_readline(False)   # отключить интеграцию с readline
 ```
 
 ---
 
-## Решение проблем
+## Shell completion
+
+```python
+cli.generate_completion("bash")            # вернёт сам скрипт
+cli.install_completion("zsh")              # запишет в дефолтное место
+cli.install_completion("fish", "/tmp/x")   # запишет по указанному пути
+```
+
+Также экспортируется enum `Shell` (`Shell.BASH`, `Shell.ZSH`,
+`Shell.FISH`). Дефолтные пути установки:
+
+| Shell | Путь |
+|-------|------|
+| bash  | `~/.bash_completion.d/<n>.bash` |
+| zsh   | `~/.zsh/completions/_<n>` |
+| fish  | `~/.config/fish/completions/<n>.fish` |
+
+---
+
+## Плагины
+
+Поиск и вызов внешних пакетов, зарегистрированных под группой entry
+points (`importlib.metadata`):
+
+```python
+results = cli.load_plugins("myapp.plugins", fail_fast=False)
+# {"audit": True, "metrics": False, ...}
+```
+
+В `pyproject.toml` плагин-пакета:
+
+```toml
+[project.entry-points."myapp.plugins"]
+audit = "myaudit.plugin:register"
+```
+
+`myaudit.plugin.register(cli)` регистрирует команды, хуки или middleware.
+
+Standalone-хелперы: `discover_plugins(group)`, `load_plugins(cli, group)`.
+Ошибки: `PluginError`.
+
+---
+
+## Auto-generation
+
+`cli.generate_from(obj, safe_mode=True)` интроспектирует функцию, класс
+или экземпляр и регистрирует команды без декораторов. С `safe_mode`
+приватные атрибуты (с подчёркиванием) пропускаются, а
+неинстанцируемые классы вызывают warning вместо исключения.
+
+```python
+class Math:
+    def add(self, a: int, b: int) -> int:
+        return 0
+    def mul(self, a: int, b: int) -> int:
+        return 0
+
+cli.generate_from(Math)   # зарегистрирует "math.add", "math.mul"
+```
+
+Параметры с дефолтами становятся опциями; без дефолтов — обязательными
+позиционными аргументами. Boolean-параметры становятся флагами.
+
+---
+
+## Справка по API
+
+### `CLI`
+
+```python
+CLI(
+    name: str = "app",
+    config_path: str | None = None,
+    config_provider: ConfigProvider | None = None,
+    config_schema: dict[str, Any] | None = None,
+    message_provider: MessageProvider | None = None,
+    output_formatter: OutputFormatter | None = None,
+    command_registry: CommandRegistry | None = None,
+    argument_parser: ArgumentParser | None = None,
+    log_level: int = logging.INFO,
+    auto_logging_middleware: bool = False,
+    include_default_registry: bool = True,
+    shell_posix: bool | None = None,
+)
+```
+
+`shell_posix` управляет тем, как REPL разбивает строки ввода на токены.
+`True` — режим `shlex` POSIX (кавычки интерпретируются и снимаются).
+`False` — токены сохраняются сырыми, фреймворк только снимает совпадающие
+внешние кавычки; удобно на Windows, чтобы пути вида `C:\Users\foo` не
+требовали экранирования. `None` (по умолчанию) — POSIX на Unix,
+non-POSIX на Windows.
+
+Методы (выборка; полный список — в `cli/application.py`):
+
+| Метод | Назначение |
+|-------|------------|
+| `command`, `argument`, `option`, `example`, `group` | bound-декораторы |
+| `before`, `after`, `on_error_for` | per-command хуки |
+| `use(middleware)` | добавить async middleware |
+| `use_logging_middleware()` | зарегистрировать встроенный tracer |
+| `add_hook(hook)` | зарегистрировать глобальный `Hook` |
+| `add_cleanup_callback(cb)` | sync или async коллбэк |
+| `get_context()` / `set_context(**kwargs)` | command-scoped `ContextVar` |
+| `enable_readline(enable=True)` | переключение readline в REPL |
+| `load_plugins(group, fail_fast=False)` | вызов entry-point плагинов |
+| `generate_completion(shell)` | вернуть строку с completion-скриптом |
+| `install_completion(shell, path=None)` | записать completion-скрипт на диск |
+| `generate_from(obj, safe_mode=True)` | автогенерация из класса/функции |
+| `register_all_commands()` | принудительный обход реестра (вызывается на первом запуске) |
+| `run(args=None)` | sync entry point → exit code |
+| `run_async(args=None)` | async entry point → exit code |
+| `run_interactive()` | войти в REPL напрямую |
+
+Атрибуты:
+
+| Атрибут | Тип |
+|---------|-----|
+| `config` | `ConfigProvider` |
+| `messages` | `MessageProvider` |
+| `output` | `OutputFormatter` |
+| `commands` | `CommandRegistry` |
+| `parser` | `ArgumentParser` |
+| `pipeline` | `MiddlewarePipeline` |
+| `hook_manager` | `HookManager` |
+| `executor` | `CommandExecutor` |
+| `exit_code` | `int` (результат последней команды) |
+
+### Публичные экспорты `cli`
+
+```
+CLI, CLIError, CommandExecutionError, DEFAULT_CONFIG_SCHEMA, cli_context
+
+command, argument, option, example, group, register_commands,
+clear_registry, clear_default_registry, get_default_registry,
+CommandMetadataRegistry, BoundDecorators, RESERVED_NAMES
+
+ConfigProvider, MessageProvider, OutputFormatter, CommandRegistry,
+ArgumentParser, CommandHandler, Middleware, Hook
+
+JsonConfigProvider, ConfigError, ConfigValidationError, ConfigIOError,
+ConfigLockError, sanitize_for_logging, EnvOverlayConfigProvider
+
+ConfigBasedMessageProvider, MessageError
+
+TerminalOutputFormatter, echo, style, progress_bar, table
+
+CommandRegistryImpl, EnhancedArgumentParser
+
+Shell, generate_completion
+
+PluginError, discover_plugins, load_plugins
+
+__version__, get_version, get_version_tuple
+```
+
+---
+
+## Траблшутинг
 
 ### Цвета не отображаются
 
-```python
-cli = CLI(name='app', output_formatter=TerminalOutputFormatter(use_colors=True))
-```
+Вывод определён как не-TTY (пайп или редирект). Принудительно включить
+цвета можно через свой `TerminalOutputFormatter` с `force_color=True`,
+либо вручную выводить ANSI через `style()`.
 
-### Tab completion не работает (Windows)
+### Tab-completion не работает в REPL
 
-```bash
-pip install pyreadline3
-```
+Нужен `readline` (стандартная библиотека на Linux/macOS) либо
+`pyreadline3` на Windows. Проверка: `cli.enable_readline(True)`.
+Completion срабатывает только для первого whitespace-разделённого
+токена (имя команды) и длинных опций.
 
-### Ошибка версии Python
+### `RuntimeError: CLI Framework requires Python 3.10+`
 
-Требуется Python 3.8+. Проверьте: `python --version`
+Бросается из `cli/__init__.py` при импорте. Обновить Python.
 
-### Конфликт зарезервированных имён
+### Конфликт зарезервированного имени
 
-Избегайте: `help`, `h`, `_cli_help`, `_cli_show_help`
+`help`, `h`, `_cli_help`, `_cli_show_help` нельзя использовать как
+команды, алиасы, опции, короткие флаги или параметры функции.
+Переименовать или сделать алиас.
 
-```python
-# Неправильно
-@cli.argument('help')
+### Per-command хук не прервал команду
 
-# Правильно
-@cli.argument('help_text')
-```
+Это by design — исключения в `before` / `after` / `on_error_for`
+логируются, но не пробрасываются. Для валидации входов фейлите внутри
+самого handler-а.
 
-### Контекст недоступен в команде
+### Неправильный порядок аргументов
 
-Контекст доступен только в middleware. Сохраните данные в переменных модуля:
+Декораторы стекаются снизу вверх; `@cli.argument` пишутся в обратном
+порядке так, чтобы **первый** параметр функции соответствовал
+**последнему** декоратору сверху функции.
 
-```python
-current_context = {}
+### Группа теряет состояние между вызовами
 
-async def store_middleware(next_handler):
-    ctx = cli.get_context()
-    current_context.update(ctx)
-    return await next_handler()
+Класс группы инстанцируется один раз на `cli.run()`. В CLI-режиме это
+значит свежий instance на процесс — используйте module-level state или
+персистите на диск (см. `examples/08_todo_app.py`).
 
-cli.use(store_middleware)
+### Async cleanup-коллбэк отвалился по таймауту
 
-@cli.command()
-def cmd():
-    username = current_context.get('username')
-```
-
-### Вывод не перенаправляется
-
-Используйте параметр `file`:
-
-```python
-import sys
-
-echo('Ошибка', 'error', file=sys.stderr)
-table(headers, rows, file=sys.stderr)
-
-with open('log.txt', 'w') as f:
-    echo('В файл', file=f)
-```
-
----
-
-## Архитектура
-
-Модульная архитектура с чёткими интерфейсами:
-
-- **CLI** — главный оркестратор
-- **CommandRegistry** — хранилище команд с Trie-автодополнением
-- **ArgumentParser** — парсинг с LRU кэшем
-- **ConfigProvider** — конфигурация с блокировками
-- **MessageProvider** — локализация с кэшированием
-- **OutputFormatter** — форматированный вывод
-- **Middleware** — расширяемая цепочка обработки
-- **Hook** — система событий жизненного цикла
-
-Все компоненты реализуют абстрактные интерфейсы из `interfaces.py`, позволяя легко заменять их пользовательскими реализациями.
-
----
-
-## Версия
-
-CLI Framework **v1.1.0** от **Psinadev**
-
-Полная английская документация: [DOCS.md](DOCS.md)
+На каждый cleanup-коллбэк есть бюджет 5 секунд. Вынесите долгую работу
+из cleanup или разбейте на несколько коллбэков.

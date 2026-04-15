@@ -1,92 +1,122 @@
 """
-Main CLI application class
-
-Provides the core CLI application with command execution, middleware support,
-async operations, signal handling, and configuration management.
+Main CLI application class.
 """
 
-import asyncio
-import inspect
-import os
-import sys
-import logging
-import traceback
-import signal
-import threading
-import functools
-from typing import Any, Callable, Dict, List, Optional, Union, Type, Awaitable
-from contextvars import ContextVar, copy_context, Token
+from __future__ import annotations
 
-from .interfaces import (
-    ConfigProvider, MessageProvider, OutputFormatter,
-    CommandRegistry, ArgumentParser, Hook
-)
+import asyncio
+import functools
+import inspect
+import logging
+import os
+import shlex
+import signal
+import sys
+import threading
+import traceback
+from contextvars import ContextVar, Token, copy_context
+from typing import Any, Awaitable, Callable, Type, Union
+from weakref import WeakKeyDictionary
+
+from .command import CommandRegistryImpl, EnhancedArgumentParser
 from .config import JsonConfigProvider
+from .decorators import (
+    BoundDecorators,
+    CommandMetadataRegistry,
+    is_async_function,
+    register_commands,
+)
+from .interfaces import (
+    ArgumentParser,
+    CommandRegistry,
+    ConfigProvider,
+    Hook,
+    MessageProvider,
+    OutputFormatter,
+)
 from .messages import ConfigBasedMessageProvider
 from .output import TerminalOutputFormatter, echo
-from .command import CommandRegistryImpl, EnhancedArgumentParser
-from .decorators import register_commands, is_async_function
 
-cli_context: ContextVar[Dict[str, Any]] = ContextVar('cli_context', default={})
+_DEFAULT_SENTINEL: Any = object()
 
-DEFAULT_CONFIG_SCHEMA: Dict[str, Any] = {
+cli_context: ContextVar[dict[str, Any] | None] = ContextVar(
+    "cli_context", default=None
+)
+
+
+def _get_context() -> dict[str, Any]:
+    """Return current context dict or empty dict if unset (never the default)."""
+    value = cli_context.get()
+    return value if value is not None else {}
+
+
+DEFAULT_CONFIG_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
-        "version": {
-            "type": "string"
-        },
-        "welcome_message": {
-            "type": "string"
-        },
-        "help_hint": {
-            "type": "string"
-        },
-        "prompt": {
-            "type": "string"
-        },
-        "default_language": {
-            "type": "string"
-        },
-        "current_language": {
-            "type": "string"
-        },
+        "version": {"type": "string"},
+        "welcome_message": {"type": "string"},
+        "help_hint": {"type": "string"},
+        "prompt": {"type": "string"},
+        "default_language": {"type": "string"},
+        "current_language": {"type": "string"},
         "languages": {
             "type": "array",
             "items": {"type": "string"},
-            "minItems": 1
+            "minItems": 1,
         },
         "messages": {
             "type": "object",
             "additionalProperties": {
                 "type": "object",
-                "additionalProperties": {"type": "string"}
-            }
-        }
+                "additionalProperties": {"type": "string"},
+            },
+        },
     },
-    "required": ["version", "default_language", "languages"]
+    "required": ["version", "default_language", "languages"],
 }
 
 
 class CLIError(Exception):
-    """Base exception for CLI errors"""
-    pass
+    """Base exception for CLI errors."""
 
 
 class CommandExecutionError(CLIError):
-    """Command execution failed"""
-    pass
+    """Command execution failed."""
+
+
+_signature_cache: WeakKeyDictionary[Callable[..., Any], inspect.Signature] = (
+    WeakKeyDictionary()
+)
+_signature_cache_lock = threading.Lock()
+
+
+def _cached_signature(func: Callable[..., Any]) -> inspect.Signature:
+    cached = _signature_cache.get(func)
+    if cached is not None:
+        return cached
+    with _signature_cache_lock:
+        cached = _signature_cache.get(func)
+        if cached is None:
+            cached = inspect.signature(func)
+            _signature_cache[func] = cached
+        return cached
 
 
 class MiddlewarePipeline:
-    """Manages middleware chain execution"""
+    """Manages middleware chain execution."""
 
-    def __init__(self):
-        self._middlewares: List[Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]] = []
+    def __init__(self) -> None:
+        self._middlewares: list[
+            Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]
+        ] = []
         self._lock = threading.Lock()
-        self._logger = logging.getLogger('cliframework.middleware')
 
-    def add(self, middleware: Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]) -> None:
-        """Add middleware to pipeline"""
+    def add(
+        self,
+        middleware: Callable[
+            [Callable[[], Awaitable[Any]]], Awaitable[Any]
+        ],
+    ) -> None:
         with self._lock:
             if not asyncio.iscoroutinefunction(middleware):
                 raise TypeError(
@@ -94,229 +124,212 @@ class MiddlewarePipeline:
                 )
             self._middlewares.append(middleware)
 
-    def build(self, final_handler: Callable[[], Awaitable[Any]]) -> Callable[[], Awaitable[Any]]:
-        """Build middleware chain with proper closure handling"""
+    def build(
+        self,
+        final_handler: Callable[[], Awaitable[Any]],
+    ) -> Callable[[], Awaitable[Any]]:
         with self._lock:
-            middlewares_snapshot = list(self._middlewares)
+            snapshot = list(self._middlewares)
 
         handler = final_handler
-
-        for middleware in reversed(middlewares_snapshot):
-            def make_wrapper(mw: Callable, next_h: Callable) -> Callable[[], Awaitable[Any]]:
+        for middleware in reversed(snapshot):
+            def make_wrapper(
+                mw: Callable[..., Awaitable[Any]],
+                next_h: Callable[[], Awaitable[Any]],
+            ) -> Callable[[], Awaitable[Any]]:
                 async def wrapper() -> Any:
                     return await mw(next_h)
+
                 return wrapper
 
             handler = make_wrapper(middleware, handler)
-
         return handler
 
 
 class HookManager:
-    """Manages lifecycle hooks"""
+    """Manages global and per-command lifecycle hooks."""
 
-    def __init__(self):
-        self._hooks: List[Hook] = []
+    def __init__(self) -> None:
+        self._hooks: list[Hook] = []
+        self._per_command: dict[str, dict[str, list[Callable[..., Any]]]] = {}
         self._lock = threading.Lock()
-        self._logger = logging.getLogger('cliframework.hooks')
+        self._logger = logging.getLogger("cliframework.hooks")
 
     def add_hook(self, hook: Hook) -> None:
-        """Add a hook to the manager"""
         with self._lock:
             self._hooks.append(hook)
-            self._logger.debug(f"Added hook: {hook.__class__.__name__}")
 
-    async def on_before_parse(self, args: List[str]) -> List[str]:
-        """Execute before_parse hooks"""
+    def add_per_command_hook(
+        self,
+        command_name: str,
+        phase: str,
+        func: Callable[..., Any],
+    ) -> None:
+        if phase not in ("before", "after", "error"):
+            raise ValueError(
+                f"phase must be 'before', 'after', or 'error', got {phase!r}"
+            )
+        with self._lock:
+            self._per_command.setdefault(
+                command_name, {"before": [], "after": [], "error": []}
+            )[phase].append(func)
+
+    async def on_before_parse(self, args: list[str]) -> list[str]:
         result = args
-        for hook in self._hooks:
+        for hook in self._snapshot():
             try:
                 result = await hook.on_before_parse(result)
-            except Exception as e:
-                self._logger.error(f"Error in hook {hook.__class__.__name__}.on_before_parse: {e}")
+            except Exception as exc:
+                self._logger.error(
+                    f"Error in hook {hook.__class__.__name__}.on_before_parse: {exc}"
+                )
         return result
 
-    async def on_after_parse(self, parsed: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute after_parse hooks"""
+    async def on_after_parse(
+        self, parsed: dict[str, Any]
+    ) -> dict[str, Any]:
         result = parsed
-        for hook in self._hooks:
+        for hook in self._snapshot():
             try:
                 result = await hook.on_after_parse(result)
-            except Exception as e:
-                self._logger.error(f"Error in hook {hook.__class__.__name__}.on_after_parse: {e}")
+            except Exception as exc:
+                self._logger.error(
+                    f"Error in hook {hook.__class__.__name__}.on_after_parse: {exc}"
+                )
         return result
 
-    async def on_before_execute(self, command: str, kwargs: Dict[str, Any]) -> None:
-        """Execute before_execute hooks"""
-        for hook in self._hooks:
+    async def on_before_execute(
+        self, command: str, kwargs: dict[str, Any]
+    ) -> None:
+        for hook in self._snapshot():
             try:
                 await hook.on_before_execute(command, kwargs)
-            except Exception as e:
-                self._logger.error(f"Error in hook {hook.__class__.__name__}.on_before_execute: {e}")
+            except Exception as exc:
+                self._logger.error(
+                    f"Error in hook {hook.__class__.__name__}.on_before_execute: {exc}"
+                )
+        await self._run_per_command(command, "before", kwargs)
 
-    async def on_after_execute(self, command: str, result: Any, exit_code: int) -> None:
-        """Execute after_execute hooks"""
-        for hook in self._hooks:
+    async def on_after_execute(
+        self, command: str, result: Any, exit_code: int
+    ) -> None:
+        for hook in self._snapshot():
             try:
                 await hook.on_after_execute(command, result, exit_code)
-            except Exception as e:
-                self._logger.error(f"Error in hook {hook.__class__.__name__}.on_after_execute: {e}")
+            except Exception as exc:
+                self._logger.error(
+                    f"Error in hook {hook.__class__.__name__}.on_after_execute: {exc}"
+                )
+        await self._run_per_command(command, "after", result, exit_code)
 
-    async def on_error(self, command: str, error: Exception) -> None:
-        """Execute error hooks"""
-        for hook in self._hooks:
+    async def on_error(
+        self, command: str, error: BaseException
+    ) -> None:
+        for hook in self._snapshot():
             try:
                 await hook.on_error(command, error)
-            except Exception as e:
-                self._logger.error(f"Error in hook {hook.__class__.__name__}.on_error: {e}")
+            except Exception as exc:
+                self._logger.error(
+                    f"Error in hook {hook.__class__.__name__}.on_error: {exc}"
+                )
+        await self._run_per_command(command, "error", error)
+
+    def _snapshot(self) -> list[Hook]:
+        with self._lock:
+            return list(self._hooks)
+
+    def _per_command_snapshot(
+        self, command: str, phase: str
+    ) -> list[Callable[..., Any]]:
+        with self._lock:
+            return list(
+                self._per_command.get(command, {}).get(phase, [])
+            )
+
+    async def _run_per_command(
+        self, command: str, phase: str, *args: Any
+    ) -> None:
+        for fn in self._per_command_snapshot(command, phase):
+            try:
+                if asyncio.iscoroutinefunction(fn):
+                    await fn(*args)
+                else:
+                    result = fn(*args)
+                    if inspect.isawaitable(result):
+                        await result
+            except Exception as exc:
+                self._logger.error(
+                    f"Per-command {phase} hook for '{command}' raised: {exc}",
+                    exc_info=True,
+                )
 
 
 class CommandExecutor:
-    """Handles command execution with middleware and hooks support"""
+    """Handles command execution with middleware and hooks."""
 
-    def __init__(self, commands: CommandRegistry, messages: MessageProvider,
-                 output: OutputFormatter, pipeline: MiddlewarePipeline,
-                 hook_manager: HookManager):
+    def __init__(
+        self,
+        commands: CommandRegistry,
+        messages: MessageProvider,
+        output: OutputFormatter,
+        pipeline: MiddlewarePipeline,
+        hook_manager: HookManager,
+        bypass_middleware: set[str] | None = None,
+    ) -> None:
         self.commands = commands
         self.messages = messages
         self.output = output
         self.pipeline = pipeline
         self.hook_manager = hook_manager
-        self._logger = logging.getLogger('cliframework.executor')
+        self.bypass_middleware: set[str] = bypass_middleware or set()
+        self._logger = logging.getLogger("cliframework.executor")
 
-    def _suggest_similar_commands(self, command: str, max_suggestions: int = 3) -> List[str]:
-        """Find similar commands using Levenshtein distance"""
-        def levenshtein_distance(s1: str, s2: str, max_dist: int = 3) -> int:
-            if len(s1) < len(s2):
-                return levenshtein_distance(s2, s1, max_dist)
-            if len(s2) == 0:
-                return len(s1)
-
-            if abs(len(s1) - len(s2)) > max_dist:
-                return max_dist + 1
-
-            previous_row = range(len(s2) + 1)
-            for i, c1 in enumerate(s1):
-                current_row = [i + 1]
-                min_in_row = i + 1
-
-                for j, c2 in enumerate(s2):
-                    insertions = previous_row[j + 1] + 1
-                    deletions = current_row[j] + 1
-                    substitutions = previous_row[j] + (c1 != c2)
-                    val = min(insertions, deletions, substitutions)
-                    current_row.append(val)
-                    min_in_row = min(min_in_row, val)
-
-                if min_in_row > max_dist:
-                    return max_dist + 1
-
-                previous_row = current_row
-
-            return previous_row[-1]
-
-        all_commands = self.commands.list_commands()
-        suggestions = []
-        command_lower = command.lower()
-
-        for cmd in all_commands:
-            if abs(len(cmd) - len(command)) > 3:
-                continue
-
-            distance = levenshtein_distance(command_lower, cmd.lower(), max_dist=3)
-            if distance <= 3:
-                suggestions.append((distance, cmd))
-
-        suggestions.sort(key=lambda x: (x[0], x[1]))
-        return [cmd for _, cmd in suggestions[:max_suggestions]]
-
-    async def execute(self, command: str, cli_instance: Any, **kwargs: Any) -> int:
-        """Execute command with error handling, middleware, and hooks"""
-        command_meta: Optional[Dict[str, Any]] = self.commands.get_command(command)
+    async def execute(
+        self, command: str, cli_instance: Any, **kwargs: Any
+    ) -> int:
+        command_meta = self.commands.get_command(command)
 
         if not command_meta:
-            error_msg: str = self.messages.get_message(
-                'command_not_found',
+            error_msg = self.messages.get_message(
+                "command_not_found",
                 default="Command '{command}' not found",
-                command=command
+                command=command,
             )
-            echo(error_msg, 'error', formatter=self.output)
-
+            echo(error_msg, "error", formatter=self.output)
             suggestions = self._suggest_similar_commands(command)
             if suggestions:
-                suggestion_str = ', '.join(suggestions)
                 did_you_mean = self.messages.get_message(
-                    'did_you_mean',
+                    "did_you_mean",
                     default="Did you mean: {suggestions}?",
-                    suggestions=suggestion_str
+                    suggestions=", ".join(suggestions),
                 )
-                echo(did_you_mean, 'info', formatter=self.output)
+                echo(did_you_mean, "info", formatter=self.output)
             return 1
 
-        handler: Callable[..., Any] = command_meta.get('handler')
+        handler: Callable[..., Any] = command_meta.get("handler")
         if not handler:
-            echo(f"Command '{command}' has no handler", 'error', formatter=self.output)
+            echo(
+                f"Command '{command}' has no handler",
+                "error",
+                formatter=self.output,
+            )
             return 1
 
         try:
-            sig: inspect.Signature = inspect.signature(handler)
-            positional_args: List[Any] = []
-            command_kwargs: Dict[str, Any] = {}
-            has_var_keyword: bool = False
-            param_names: List[str] = []
-            required_missing: List[str] = []
-            reserved_keys = {'_cli_help', '_cli_show_help'}
-
-            for param_name, param in sig.parameters.items():
-                if param_name in ('self', 'cls'):
-                    continue
-                if param.kind == inspect.Parameter.VAR_POSITIONAL:
-                    continue
-                elif param.kind == inspect.Parameter.VAR_KEYWORD:
-                    has_var_keyword = True
-                    continue
-
-                param_names.append(param_name)
-                if param_name in kwargs:
-                    value = kwargs[param_name]
-                    if param.kind == inspect.Parameter.POSITIONAL_ONLY:
-                        positional_args.append(value)
-                    else:
-                        command_kwargs[param_name] = value
-                elif param.default != inspect.Parameter.empty:
-                    command_kwargs[param_name] = param.default
-                else:
-                    required_missing.append(param_name)
-
-            if required_missing:
-                args_str = ', '.join(f"'{n}'" for n in required_missing)
-                error_msg = f"Missing required arguments for command '{command}': {args_str}"
-                echo(error_msg, 'error', formatter=self.output)
-                return 1
-
-            unknown_keys = [k for k in kwargs.keys()
-                          if k not in param_names and k not in reserved_keys]
-
-            if unknown_keys:
-                if has_var_keyword:
-                    for key in unknown_keys:
-                        command_kwargs[key] = kwargs[key]
-                else:
-                    unknown_str = ', '.join(f'--{k}' for k in unknown_keys)
-                    error_msg = f"Unknown options for command '{command}': {unknown_str}"
-                    echo(error_msg, 'error', formatter=self.output)
-                    return 1
-
-        except (TypeError, ValueError, KeyError) as e:
-            self._logger.error(f"Error preparing command arguments: {e}")
-            echo(f"Invalid arguments: {e}", 'error', formatter=self.output)
+            positional_args, command_kwargs = self._bind_arguments(
+                command, handler, kwargs
+            )
+        except CLIError as exc:
+            echo(str(exc), "error", formatter=self.output)
             return 1
 
-        token: Token = cli_context.set({
-            'command': command,
-            'args': kwargs,
-            'cli_instance': cli_instance
-        })
+        token: Token = cli_context.set(
+            {
+                "command": command,
+                "args": kwargs,
+                "cli_instance": cli_instance,
+            }
+        )
 
         try:
             await self.hook_manager.on_before_execute(command, command_kwargs)
@@ -324,143 +337,266 @@ class CommandExecutor:
             async def execute_handler() -> Any:
                 if is_async_function(handler):
                     return await handler(*positional_args, **command_kwargs)
-                else:
-                    ctx = copy_context()
-                    loop = asyncio.get_running_loop()
-                    return await loop.run_in_executor(
-                        None,
-                        lambda: ctx.run(
-                            functools.partial(handler, *positional_args, **command_kwargs)
+                ctx = copy_context()
+                loop = asyncio.get_running_loop()
+                result = await loop.run_in_executor(
+                    None,
+                    lambda: ctx.run(
+                        functools.partial(
+                            handler, *positional_args, **command_kwargs
                         )
-                    )
+                    ),
+                )
+                if inspect.isawaitable(result):
+                    return await result
+                return result
 
-            final_handler = self.pipeline.build(execute_handler)
-            result: Any = await final_handler()
+            if command in self.bypass_middleware:
+                final_handler = execute_handler
+            else:
+                final_handler = self.pipeline.build(execute_handler)
 
-            if isinstance(result, int):
+            result = await final_handler()
+            if inspect.isawaitable(result):
+                result = await result
+
+            if isinstance(result, bool):
+                exit_code = 1 if result is False else 0
+            elif isinstance(result, int):
                 exit_code = result
-            elif result is False:
-                exit_code = 1
             else:
                 exit_code = 0
 
-            await self.hook_manager.on_after_execute(command, result, exit_code)
+            await self.hook_manager.on_after_execute(
+                command, result, exit_code
+            )
             return exit_code
 
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as exc:
             self._logger.info(f"Command '{command}' was cancelled")
-            await self.hook_manager.on_error(command, asyncio.CancelledError())
+            await self.hook_manager.on_error(command, exc)
             raise
         except KeyboardInterrupt:
             self._logger.info("Command execution interrupted by user")
             raise
         except CommandExecutionError:
             raise
-        except Exception as e:
-            self._logger.error(f"Error executing command '{command}': {e}", exc_info=True)
-            await self.hook_manager.on_error(command, e)
+        except Exception as exc:
+            self._logger.error(
+                f"Error executing command '{command}': {exc}", exc_info=True
+            )
+            await self.hook_manager.on_error(command, exc)
 
             error_msg = self.messages.get_message(
-                'execution_error',
-                default='Error: {error}',
-                error=str(e)
+                "execution_error",
+                default="Error: {error}",
+                error=str(exc),
             )
-            echo(error_msg, 'error', formatter=self.output)
+            echo(error_msg, "error", formatter=self.output)
 
             if self._logger.isEnabledFor(logging.DEBUG):
-                echo("\nTraceback:", 'error', formatter=self.output)
+                echo("\nTraceback:", "error", formatter=self.output)
                 print(traceback.format_exc(), file=sys.stderr)
-            raise CommandExecutionError(str(e)) from e
+            raise CommandExecutionError(str(exc)) from exc
         finally:
             cli_context.reset(token)
 
+    def _bind_arguments(
+        self,
+        command: str,
+        handler: Callable[..., Any],
+        kwargs: dict[str, Any],
+    ) -> tuple[list[Any], dict[str, Any]]:
+        try:
+            sig = _cached_signature(handler)
+        except (TypeError, ValueError) as exc:
+            raise CLIError(f"Cannot inspect handler signature: {exc}")
+
+        positional_args: list[Any] = []
+        command_kwargs: dict[str, Any] = {}
+        has_var_keyword = False
+        param_names: list[str] = []
+        required_missing: list[str] = []
+        reserved_keys = {"_cli_help", "_cli_show_help"}
+
+        for param_name, param in sig.parameters.items():
+            if param_name in ("self", "cls"):
+                continue
+            if param.kind == inspect.Parameter.VAR_POSITIONAL:
+                continue
+            if param.kind == inspect.Parameter.VAR_KEYWORD:
+                has_var_keyword = True
+                continue
+
+            param_names.append(param_name)
+            if param_name in kwargs:
+                value = kwargs[param_name]
+                if param.kind == inspect.Parameter.POSITIONAL_ONLY:
+                    positional_args.append(value)
+                else:
+                    command_kwargs[param_name] = value
+            elif param.default is not inspect.Parameter.empty:
+                command_kwargs[param_name] = param.default
+            else:
+                required_missing.append(param_name)
+
+        if required_missing:
+            args_str = ", ".join(f"'{n}'" for n in required_missing)
+            raise CLIError(
+                f"Missing required arguments for command '{command}': {args_str}"
+            )
+
+        unknown_keys = [
+            k for k in kwargs
+            if k not in param_names and k not in reserved_keys
+        ]
+        if unknown_keys:
+            if has_var_keyword:
+                for key in unknown_keys:
+                    command_kwargs[key] = kwargs[key]
+            else:
+                unknown_str = ", ".join(f"--{k}" for k in unknown_keys)
+                raise CLIError(
+                    f"Unknown options for command '{command}': {unknown_str}"
+                )
+
+        return positional_args, command_kwargs
+
+    def _suggest_similar_commands(
+        self, command: str, max_suggestions: int = 3
+    ) -> list[str]:
+        def levenshtein(s1: str, s2: str, max_dist: int = 3) -> int:
+            if len(s1) < len(s2):
+                return levenshtein(s2, s1, max_dist)
+            if not s2:
+                return len(s1)
+            if abs(len(s1) - len(s2)) > max_dist:
+                return max_dist + 1
+
+            previous_row = list(range(len(s2) + 1))
+            for i, c1 in enumerate(s1):
+                current_row = [i + 1]
+                min_in_row = i + 1
+                for j, c2 in enumerate(s2):
+                    insertions = previous_row[j + 1] + 1
+                    deletions = current_row[j] + 1
+                    substitutions = previous_row[j] + (c1 != c2)
+                    val = min(insertions, deletions, substitutions)
+                    current_row.append(val)
+                    min_in_row = min(min_in_row, val)
+                if min_in_row > max_dist:
+                    return max_dist + 1
+                previous_row = current_row
+            return previous_row[-1]
+
+        all_commands = self.commands.list_commands()
+        suggestions: list[tuple[int, str]] = []
+        command_lower = command.lower()
+        for cmd in all_commands:
+            if abs(len(cmd) - len(command)) > 3:
+                continue
+            distance = levenshtein(command_lower, cmd.lower(), max_dist=3)
+            if distance <= 3:
+                suggestions.append((distance, cmd))
+        suggestions.sort(key=lambda x: (x[0], x[1]))
+        return [cmd for _, cmd in suggestions[:max_suggestions]]
+
 
 class InteractiveShell:
-    """Interactive REPL shell"""
+    """Interactive REPL shell."""
 
-    def __init__(self, cli_instance: 'CLI'):
+    def __init__(self, cli_instance: CLI) -> None:
         self.cli = cli_instance
-        self._logger = logging.getLogger('cliframework.shell')
+        self._logger = logging.getLogger("cliframework.shell")
         self._interrupt_count = 0
 
     def setup_readline_completion(self) -> None:
-        """Setup tab completion for interactive mode"""
         if not self.cli._use_readline:
             return
-
         try:
             import readline
         except ImportError:
             try:
                 import pyreadline3 as readline
-                self._logger.debug("Using pyreadline3 for Windows tab completion")
             except ImportError:
                 self._logger.warning("readline/pyreadline3 not available")
                 self.cli._use_readline = False
                 return
 
-        class CommandCompleter:
-            def __init__(self, commands: CommandRegistry):
-                self.commands = commands
-                self.matches: List[str] = []
+        commands = self.cli.commands
 
-            def complete(self, text: str, state: int) -> Optional[str]:
+        class CommandCompleter:
+            def __init__(self) -> None:
+                self.matches: list[str] = []
+
+            def complete(self, text: str, state: int) -> str | None:
                 if state == 0:
                     if text:
-                        self.matches = self.commands.autocomplete(text)
+                        self.matches = commands.autocomplete(text)
                     else:
-                        self.matches = self.commands.list_commands()
+                        self.matches = commands.list_commands()
                 try:
                     return self.matches[state]
                 except IndexError:
                     return None
 
-        completer = CommandCompleter(self.cli.commands)
+        completer = CommandCompleter()
         readline.set_completer(completer.complete)
-        readline.parse_and_bind('tab: complete')
-        readline.set_completer_delims(' \t\n')
-        self._logger.debug("Readline tab completion enabled")
+        readline.parse_and_bind("tab: complete")
+        readline.set_completer_delims(" \t\n")
 
     def handle_interrupt(self) -> bool:
-        """Handle KeyboardInterrupt, returns True if should exit"""
         self._interrupt_count += 1
         if self._interrupt_count == 1:
-            echo("\n^C (Press Ctrl+C again to force exit, or type 'exit')",
-                "warning", formatter=self.cli.output)
+            echo(
+                "\n^C (Press Ctrl+C again to force exit, or type 'exit')",
+                "warning",
+                formatter=self.cli.output,
+            )
             return False
-        else:
-            self._logger.warning("Force exit requested")
-            echo("\nForce exiting...", "error", formatter=self.cli.output)
-            return True
+        echo("\nForce exiting...", "error", formatter=self.cli.output)
+        return True
 
     async def run(self) -> int:
-        """Run interactive REPL"""
         self.setup_readline_completion()
 
-        echo(self.cli.config.get('welcome_message', f"Welcome to {self.cli.name}"),
-            'info', formatter=self.cli.output)
-        echo(self.cli.config.get('help_hint', "Type 'help' for commands or 'exit' to quit"),
-            'info', formatter=self.cli.output)
+        echo(
+            self.cli.config.get(
+                "welcome_message", f"Welcome to {self.cli.name}"
+            ),
+            "info",
+            formatter=self.cli.output,
+        )
+        echo(
+            self.cli.config.get(
+                "help_hint", "Type 'help' for commands or 'exit' to quit"
+            ),
+            "info",
+            formatter=self.cli.output,
+        )
         print("")
 
         exit_code = 0
-        last_had_error = False
 
         while not self.cli._shutdown_requested:
+            iteration_exit_code = 0
+
             try:
                 self._interrupt_count = 0
-                prompt: str = self.cli.config.get('prompt', f"{self.cli.name}> ")
+                self.cli._maybe_print_pending_signal_message()
+                prompt: str = self.cli.config.get(
+                    "prompt", f"{self.cli.name}> "
+                )
 
                 try:
                     user_input: str = input(prompt).strip()
-                except UnicodeDecodeError as e:
-                    self._logger.debug(f"UnicodeDecodeError during input: {e}")
+                except UnicodeDecodeError:
                     if self.handle_interrupt():
                         break
                     print("")
                     continue
                 except EOFError:
-                    echo("\nExiting...", 'info', formatter=self.cli.output)
+                    echo("\nExiting...", "info", formatter=self.cli.output)
                     break
                 except KeyboardInterrupt:
                     if self.handle_interrupt():
@@ -469,83 +605,106 @@ class InteractiveShell:
                     continue
 
                 if self.cli._shutdown_requested:
-                    echo("\nShutdown requested, exiting...", 'info', formatter=self.cli.output)
+                    echo(
+                        "\nShutdown requested, exiting...",
+                        "info",
+                        formatter=self.cli.output,
+                    )
                     break
 
                 if not user_input:
                     continue
 
-                if user_input.lower() in ('exit', 'quit', 'q'):
+                if user_input.lower() in ("exit", "quit", "q"):
                     self.cli._shutdown_requested = True
-                    echo("Goodbye!", 'info', formatter=self.cli.output)
+                    echo("Goodbye!", "info", formatter=self.cli.output)
                     break
 
-                import shlex
                 try:
-                    input_args: List[str] = shlex.split(user_input)
-                except ValueError as e:
-                    echo(f"Invalid input: {e}", 'error', formatter=self.cli.output)
-                    last_had_error = True
+                    if self.cli._shell_posix:
+                        input_args = shlex.split(user_input)
+                    else:
+                        raw_tokens = shlex.split(user_input, posix=False)
+                        input_args = [
+                            t[1:-1] if len(t) >= 2 and t[0] == t[-1] and t[0] in ('"', "'")
+                            else t
+                            for t in raw_tokens
+                        ]
+                except ValueError as exc:
+                    echo(
+                        f"Invalid input: {exc}",
+                        "error",
+                        formatter=self.cli.output,
+                    )
                     continue
 
-                self._logger.debug(f"Parsed args: {input_args}")
-
                 try:
-                    input_args = await self.cli.hook_manager.on_before_parse(input_args)
-                    parsed: Dict[str, Any] = self.cli.parser.parse(input_args)
+                    input_args = await self.cli.hook_manager.on_before_parse(
+                        input_args
+                    )
+                    parsed = self.cli.parser.parse(input_args)
                     parsed = await self.cli.hook_manager.on_after_parse(parsed)
 
-                    self._logger.debug(f"Parsed result: {parsed}")
-
-                    command: Optional[str] = parsed.get('command')
+                    command = parsed.get("command")
                     if not command:
-                        echo("No command specified", 'error', formatter=self.cli.output)
-                        last_had_error = True
+                        echo(
+                            "No command specified",
+                            "error",
+                            formatter=self.cli.output,
+                        )
                         continue
 
-                    if parsed.get('_cli_show_help', False):
-                        help_text: str = self.cli.parser.generate_help(command)
-                        echo(help_text, 'info', formatter=self.cli.output)
-                        last_had_error = False
+                    if parsed.get("_cli_show_help", False):
+                        help_text = self.cli.parser.generate_help(command)
+                        echo(help_text, "info", formatter=self.cli.output)
                         continue
 
-                    command_kwargs = {k: v for k, v in parsed.items()
-                                    if k != 'command' and not k.startswith('_cli_')}
-                    exit_code = await self.cli.executor.execute(command, self.cli, **command_kwargs)
+                    command_kwargs = {
+                        k: v
+                        for k, v in parsed.items()
+                        if k != "command" and not k.startswith("_cli_")
+                    }
+                    iteration_exit_code = await self.cli.executor.execute(
+                        command, self.cli, **command_kwargs
+                    )
 
-                    if exit_code != 0 and not last_had_error:
-                        echo(f"Command returned exit code: {exit_code}",
-                            'warning', formatter=self.cli.output)
-                        last_had_error = True
-                    else:
-                        last_had_error = False
+                    if iteration_exit_code != 0:
+                        echo(
+                            f"Command returned exit code: {iteration_exit_code}",
+                            "warning",
+                            formatter=self.cli.output,
+                        )
 
                 except asyncio.CancelledError:
-                    self._logger.info("Command cancelled")
-                    echo("\nCommand cancelled", 'warning', formatter=self.cli.output)
-                    last_had_error = False
+                    echo(
+                        "\nCommand cancelled",
+                        "warning",
+                        formatter=self.cli.output,
+                    )
                     raise
-                except ValueError as e:
-                    echo(f"Error: {e}", 'error', formatter=self.cli.output)
-                    exit_code = 1
-                    last_had_error = True
+                except ValueError as exc:
+                    echo(f"Error: {exc}", "error", formatter=self.cli.output)
+                    iteration_exit_code = 1
                 except KeyboardInterrupt:
                     if self.handle_interrupt():
                         break
-                    last_had_error = False
                 except CommandExecutionError:
-                    exit_code = 1
-                    last_had_error = True
-                except Exception as e:
-                    self._logger.error(f"Unexpected error: {e}", exc_info=True)
-                    echo(f"Unexpected error: {e}", 'error', formatter=self.cli.output)
-                    exit_code = 1
-                    last_had_error = True
+                    iteration_exit_code = 1
+                except Exception as exc:
+                    self._logger.error(
+                        f"Unexpected error: {exc}", exc_info=True
+                    )
+                    echo(
+                        f"Unexpected error: {exc}",
+                        "error",
+                        formatter=self.cli.output,
+                    )
+                    iteration_exit_code = 1
 
+                exit_code = iteration_exit_code
                 print("")
 
             except asyncio.CancelledError:
-                self._logger.info("Shell cancelled")
                 break
             except KeyboardInterrupt:
                 if self.handle_interrupt():
@@ -557,71 +716,48 @@ class InteractiveShell:
 
 
 class CLI:
-    """
-    Main CLI application class
+    """Main CLI application class."""
 
-    Features:
-    - Declarative command definition via decorators
-    - Automatic CLI generation from classes/functions
-    - Async command execution
-    - Configuration persistence
-    - Message localization
-    - Formatted output
-    - Middleware support
-    - Lifecycle hooks
-    - Graceful shutdown
-    """
-
-    def __init__(self,
-                 name: str = 'app',
-                 config_path: Optional[str] = None,
-                 config_provider: Optional[ConfigProvider] = None,
-                 config_schema: Optional[Dict[str, Any]] = None,
-                 message_provider: Optional[MessageProvider] = None,
-                 output_formatter: Optional[OutputFormatter] = None,
-                 command_registry: Optional[CommandRegistry] = None,
-                 argument_parser: Optional[ArgumentParser] = None,
-                 log_level: int = logging.INFO,
-                 auto_logging_middleware: bool = False):
-        """Initialize CLI application"""
+    def __init__(
+        self,
+        name: str = "app",
+        config_path: str | None = None,
+        config_provider: ConfigProvider | None = None,
+        config_schema: dict[str, Any] | None = None,
+        message_provider: MessageProvider | None = None,
+        output_formatter: OutputFormatter | None = None,
+        command_registry: CommandRegistry | None = None,
+        argument_parser: ArgumentParser | None = None,
+        log_level: int = logging.INFO,
+        auto_logging_middleware: bool = False,
+        include_default_registry: bool = True,
+        shell_posix: bool | None = None,
+    ) -> None:
         self._setup_logging(log_level)
-        self._logger: logging.Logger = logging.getLogger(f'cliframework.app.{name}')
+        self._logger: logging.Logger = logging.getLogger(
+            f"cliframework.app.{name}"
+        )
         self._logger.info(f"Initializing CLI application '{name}'")
-
         self.name: str = name
+
+        self._registry: CommandMetadataRegistry = CommandMetadataRegistry()
+        self._decorators: BoundDecorators = BoundDecorators(self._registry)
+        self._include_default_registry: bool = include_default_registry
+        from weakref import WeakSet
+        self._registered_funcs: WeakSet = WeakSet()
 
         if config_provider is None:
             if config_path is None:
-                config_dir: str = os.path.expanduser(f"~/.config/{name}")
+                config_dir = os.path.expanduser(f"~/.config/{name}")
                 os.makedirs(config_dir, exist_ok=True)
                 config_path = os.path.join(config_dir, f"{name}.json")
 
-            default_config: Dict[str, Any] = {
-                "version": "0.1.0",
-                "welcome_message": f"Welcome to {name}",
-                "help_hint": "Type 'help' for available commands",
-                "prompt": f"{name}> ",
-                "default_language": "en",
-                "current_language": "en",
-                "languages": ["en"],
-                "messages": {
-                    "en": {
-                        "prompt": f"{name}> ",
-                        "unknown_command": "Unknown command. Type 'help' for available commands.",
-                        "available_commands": "Available commands:",
-                        "app_quit": f"Exiting {name}. Goodbye!",
-                        "command_not_found": "Command '{command}' not found.",
-                        "execution_error": "Error executing command: {error}",
-                        "did_you_mean": "Did you mean: {suggestions}?"
-                    }
-                }
-            }
-
-            schema: Optional[Dict[str, Any]] = config_schema or DEFAULT_CONFIG_SCHEMA
+            default_config = self._build_default_config(name)
+            schema = config_schema or DEFAULT_CONFIG_SCHEMA
             config_provider = JsonConfigProvider(
                 config_path,
                 default_config=default_config,
-                schema=schema
+                schema=schema,
             )
 
         self.config: ConfigProvider = config_provider
@@ -641,16 +777,26 @@ class CLI:
         self.pipeline = MiddlewarePipeline()
         self.hook_manager = HookManager()
         self.executor = CommandExecutor(
-            self.commands, self.messages, self.output,
-            self.pipeline, self.hook_manager
+            self.commands,
+            self.messages,
+            self.output,
+            self.pipeline,
+            self.hook_manager,
+            bypass_middleware={"help", "version", "exit"},
         )
 
         self.exit_code: int = 0
         self._running: bool = False
         self._shutdown_requested: bool = False
         self._commands_registered: bool = False
-        self._cleanup_callbacks: List[Union[Callable[[], None], Callable[[], Awaitable[None]]]] = []
+        self._cleanup_callbacks: list[
+            Union[Callable[[], None], Callable[[], Awaitable[None]]]
+        ] = []
         self._use_readline: bool = True
+        self._pending_signal_message: str | None = None
+        self._shell_posix: bool = (
+            shell_posix if shell_posix is not None else os.name != "nt"
+        )
 
         self._setup_signal_handlers()
         self._register_default_commands()
@@ -658,414 +804,671 @@ class CLI:
         if auto_logging_middleware:
             self.use_logging_middleware()
 
-        self._logger.debug("CLI application initialized successfully")
+    def _build_default_config(self, name: str) -> dict[str, Any]:
+        return {
+            "version": "0.1.0",
+            "welcome_message": f"Welcome to {name}",
+            "help_hint": "Type 'help' for available commands",
+            "prompt": f"{name}> ",
+            "default_language": "en",
+            "current_language": "en",
+            "languages": ["en"],
+            "messages": {
+                "en": {
+                    "prompt": f"{name}> ",
+                    "unknown_command": "Unknown command. Type 'help' for available commands.",
+                    "available_commands": "Available commands:",
+                    "app_quit": f"Exiting {name}. Goodbye!",
+                    "command_not_found": "Command '{command}' not found.",
+                    "execution_error": "Error executing command: {error}",
+                    "did_you_mean": "Did you mean: {suggestions}?",
+                }
+            },
+        }
 
     def _setup_logging(self, log_level: int) -> None:
-        """Configure logging for CLI application"""
-        logger: logging.Logger = logging.getLogger('cliframework')
+        logger = logging.getLogger("cliframework")
         logger.setLevel(log_level)
-
+        for handler in logger.handlers:
+            handler.setLevel(log_level)
         if not logger.handlers:
-            console_handler: logging.StreamHandler = logging.StreamHandler()
+            console_handler = logging.StreamHandler()
             console_handler.setLevel(log_level)
-            formatter: logging.Formatter = logging.Formatter(
-                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            console_handler.setFormatter(
+                logging.Formatter(
+                    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+                )
             )
-            console_handler.setFormatter(formatter)
             logger.addHandler(console_handler)
 
     def _setup_signal_handlers(self) -> None:
-        """Setup signal handlers for graceful shutdown"""
         if threading.current_thread() is not threading.main_thread():
-            self._logger.warning("Signal handlers can only be registered from main thread")
+            self._logger.warning(
+                "Signal handlers can only be registered from main thread"
+            )
             return
 
         def signal_handler(sig: int, frame: Any) -> None:
-            signal_name = 'SIGINT' if sig == signal.SIGINT else 'SIGTERM'
-            self._logger.info(f"Received {signal_name}, requesting shutdown")
-
+            signal_name = "SIGINT" if sig == signal.SIGINT else "SIGTERM"
             if not self._shutdown_requested:
                 self._shutdown_requested = True
-                try:
-                    echo("\nShutdown requested. Finishing current operation...",
-                        file=sys.stderr, formatter=self.output)
-                except (OSError, IOError) as e:
-                    self._logger.debug(f"Could not print shutdown message: {e}")
+                self._pending_signal_message = (
+                    f"Received {signal_name}, shutdown requested"
+                )
             else:
-                self._logger.warning(f"Received second {signal_name}, forcing exit")
-                try:
-                    echo("\nForce exiting...", file=sys.stderr, formatter=self.output)
-                except (OSError, IOError) as e:
-                    self._logger.debug(f"Could not print force exit message: {e}")
+                self._pending_signal_message = (
+                    f"Received second {signal_name}, forcing exit"
+                )
                 self._emergency_cleanup()
-                sys.exit(1)
+                os._exit(1)
 
         try:
             signal.signal(signal.SIGINT, signal_handler)
-            if hasattr(signal, 'SIGTERM'):
+            if hasattr(signal, "SIGTERM"):
                 signal.signal(signal.SIGTERM, signal_handler)
-                self._logger.debug("Signal handlers registered for SIGINT and SIGTERM")
-            else:
-                self._logger.debug("Signal handler registered for SIGINT")
-        except (ValueError, AttributeError, OSError) as e:
-            self._logger.warning(f"Could not set signal handlers: {e}")
+        except (ValueError, AttributeError, OSError) as exc:
+            self._logger.warning(f"Could not set signal handlers: {exc}")
+
+    def _maybe_print_pending_signal_message(self) -> None:
+        msg = self._pending_signal_message
+        if msg is None:
+            return
+        self._pending_signal_message = None
+        try:
+            echo(f"\n{msg}", "warning", formatter=self.output)
+        except (OSError, IOError):
+            pass
 
     def _emergency_cleanup(self) -> None:
-        """Perform synchronous cleanup on forced exit"""
         for callback in self._cleanup_callbacks:
             try:
                 if not asyncio.iscoroutinefunction(callback):
                     callback()
-            except Exception as e:
-                self._logger.error(f"Emergency cleanup error: {e}")
+            except Exception as exc:
+                self._logger.error(f"Emergency cleanup error: {exc}")
 
     def _cb_name(self, cb: Any) -> str:
-        """Safely extract callback name for logging"""
-        return getattr(cb, '__name__',
-                      getattr(cb, '__qualname__',
-                             cb.__class__.__name__))
+        return getattr(
+            cb,
+            "__name__",
+            getattr(cb, "__qualname__", cb.__class__.__name__),
+        )
 
     async def _run_cleanup_callbacks(self) -> None:
-        """Run all cleanup callbacks"""
         for callback in self._cleanup_callbacks:
             try:
                 if asyncio.iscoroutinefunction(callback):
                     await asyncio.wait_for(callback(), timeout=5.0)
-                    self._logger.debug(f"Executed async cleanup callback: {self._cb_name(callback)}")
                 else:
                     result = callback()
                     if inspect.isawaitable(result):
                         await asyncio.wait_for(result, timeout=5.0)
-                        self._logger.debug(f"Executed async callable cleanup: {self._cb_name(callback)}")
-                    else:
-                        self._logger.debug(f"Executed sync cleanup callback: {self._cb_name(callback)}")
             except asyncio.TimeoutError:
-                self._logger.error(f"Cleanup callback {self._cb_name(callback)} timed out")
-            except Exception as e:
-                self._logger.error(f"Error in cleanup callback {self._cb_name(callback)}: {e}")
+                self._logger.error(
+                    f"Cleanup callback {self._cb_name(callback)} timed out"
+                )
+            except Exception as exc:
+                self._logger.error(
+                    f"Error in cleanup callback {self._cb_name(callback)}: {exc}"
+                )
 
-    def add_cleanup_callback(self, callback: Union[Callable[[], None], Callable[[], Awaitable[None]]]) -> None:
-        """Add callback to be executed on shutdown"""
+    def add_cleanup_callback(
+        self,
+        callback: Union[Callable[[], None], Callable[[], Awaitable[None]]],
+    ) -> None:
         self._cleanup_callbacks.append(callback)
-        callback_type = "async" if asyncio.iscoroutinefunction(callback) else "sync"
-        self._logger.debug(f"Added {callback_type} cleanup callback: {self._cb_name(callback)}")
 
     def add_hook(self, hook: Hook) -> None:
-        """Add lifecycle hook"""
         self.hook_manager.add_hook(hook)
 
-    def use(self, middleware: Callable[[Callable[[], Awaitable[Any]]], Awaitable[Any]]) -> None:
-        """Add middleware to execution chain"""
+    def use(
+        self,
+        middleware: Callable[
+            [Callable[[], Awaitable[Any]]], Awaitable[Any]
+        ],
+    ) -> None:
         self.pipeline.add(middleware)
-        self._logger.debug(f"Added middleware: {self._cb_name(middleware)}")
 
     def use_logging_middleware(self) -> None:
-        """Add built-in logging middleware"""
-        async def logging_middleware(next_handler: Callable[[], Awaitable[Any]]) -> Any:
-            ctx = cli_context.get()
-            command = ctx.get('command', 'unknown')
-            args = ctx.get('args', {})
-            self._logger.debug(f"[Middleware] Executing command '{command}' with args: {args}")
-
+        async def logging_middleware(
+            next_handler: Callable[[], Awaitable[Any]],
+        ) -> Any:
+            ctx = _get_context()
+            command = ctx.get("command", "unknown")
+            args = ctx.get("args", {})
+            self._logger.debug(
+                f"[Middleware] Executing '{command}' with args: {args}"
+            )
             try:
                 result = await next_handler()
-                self._logger.debug(f"[Middleware] Command '{command}' completed with result: {result}")
+                self._logger.debug(
+                    f"[Middleware] '{command}' completed: {result}"
+                )
                 return result
-            except Exception as e:
-                self._logger.debug(f"[Middleware] Command '{command}' failed with error: {e}")
+            except Exception as exc:
+                self._logger.debug(
+                    f"[Middleware] '{command}' failed: {exc}"
+                )
                 raise
 
         self.use(logging_middleware)
-        self._logger.info("Built-in logging middleware enabled")
 
-    def get_context(self) -> Dict[str, Any]:
-        """Get current CLI context"""
-        return cli_context.get().copy()
+    def get_context(self) -> dict[str, Any]:
+        return dict(_get_context())
 
     def set_context(self, **kwargs: Any) -> None:
-        """Set CLI context variables"""
-        ctx = cli_context.get().copy()
+        ctx = dict(_get_context())
         ctx.update(kwargs)
         cli_context.set(ctx)
 
     def enable_readline(self, enable: bool = True) -> None:
-        """Enable or disable readline tab completion"""
         self._use_readline = enable
-        self._logger.debug(f"Readline {'enabled' if enable else 'disabled'}")
 
-    def _format_command_signature(self, command_meta: Dict[str, Any]) -> str:
-        """Generate brief signature for command"""
-        parts = []
-        for arg in command_meta.get('arguments', []):
-            if arg.get('optional'):
-                parts.append(f"[{arg['name']}]")
-            else:
-                parts.append(f"<{arg['name']}>")
-        for opt in command_meta.get('options', []):
-            if opt.get('is_flag'):
-                if opt.get('default') is True:
+    def _format_command_signature(
+        self, command_meta: dict[str, Any]
+    ) -> str:
+        parts: list[str] = []
+        for arg in command_meta.get("arguments", []):
+            parts.append(
+                f"[{arg['name']}]" if arg.get("optional") else f"<{arg['name']}>"
+            )
+        for opt in command_meta.get("options", []):
+            if opt.get("is_flag"):
+                if opt.get("default") is True:
                     parts.append(f"[--no-{opt['name']}]")
                 else:
                     parts.append(f"[--{opt['name']}]")
             else:
                 parts.append(f"[--{opt['name']} <value>]")
-        return ' '.join(parts)
+        return " ".join(parts)
 
     def _register_default_commands(self) -> None:
-        """Register built-in default commands"""
-        def help_command(cmd: Optional[str] = None) -> int:
-            """Show help for command or list all commands"""
+        def help_command(cmd: str | None = None) -> int:
+            """Show help for command or list all commands."""
             if cmd:
-                try:
-                    help_text: str = self.parser.generate_help(cmd)
-                    echo(help_text, 'info', formatter=self.output)
-                except Exception as e:
-                    echo(f"Error generating help: {e}", 'error', formatter=self.output)
-                    return 1
-            else:
-                echo(self.messages.get_message('available_commands', 'Available commands:'),
-                    'header', formatter=self.output)
-                commands: List[str] = self.commands.list_commands()
-                for command in sorted(commands):
-                    cmd_meta: Optional[Dict[str, Any]] = self.commands.get_command(command)
-                    if cmd_meta:
-                        help_text = cmd_meta.get('help', 'No description')
-                        signature = self._format_command_signature(cmd_meta)
-                        aliases = cmd_meta.get('aliases', [])
+                cmd_meta = self.commands.get_command(cmd)
+                if cmd_meta:
+                    try:
+                        help_text = self.parser.generate_help(cmd)
+                        echo(help_text, "info", formatter=self.output)
+                    except Exception as exc:
+                        echo(
+                            f"Error generating help: {exc}",
+                            "error",
+                            formatter=self.output,
+                        )
+                        return 1
+                    return 0
 
-                        line = f"  {command:20} {help_text}"
-                        if signature:
-                            line += f"\n    {'':20} Usage: {command} {signature}"
-                        if aliases:
-                            alias_str = f" (aliases: {', '.join(aliases)})"
-                            line += alias_str
-                        print(line)
+                if hasattr(self.commands, "find_by_prefix"):
+                    matching_commands = self.commands.find_by_prefix(cmd)
+                else:
+                    prefix_with_dot = cmd + "."
+                    matching_commands = [
+                        c for c in self.commands.list_commands()
+                        if c.startswith(prefix_with_dot) or c == cmd
+                    ]
+
+                if matching_commands:
+                    echo(
+                        f"Commands under '{cmd}':",
+                        "header",
+                        formatter=self.output,
+                    )
+                    print("")
+                    for command in sorted(matching_commands):
+                        sub_meta = self.commands.get_command(command)
+                        if sub_meta:
+                            help_text = sub_meta.get("help", "No description")
+                            signature = self._format_command_signature(sub_meta)
+                            aliases = sub_meta.get("aliases", [])
+                            line = f"  {command:30} {help_text}"
+                            if signature:
+                                line += (
+                                    f"\n    {'':30} Usage: {command} {signature}"
+                                )
+                            if aliases:
+                                line += f" (aliases: {', '.join(aliases)})"
+                            print(line)
+                    print("")
+                    echo(
+                        "Use 'help <command>' for detailed help on a specific command.",
+                        "info",
+                        formatter=self.output,
+                    )
+                    return 0
+
+                error_msg = self.messages.get_message(
+                    "command_not_found",
+                    default="Command '{command}' not found",
+                    command=cmd,
+                )
+                echo(error_msg, "error", formatter=self.output)
+                suggestions = self.executor._suggest_similar_commands(cmd)
+                if suggestions:
+                    did_you_mean = self.messages.get_message(
+                        "did_you_mean",
+                        default="Did you mean: {suggestions}?",
+                        suggestions=", ".join(suggestions),
+                    )
+                    echo(did_you_mean, "info", formatter=self.output)
+                return 1
+
+            echo(
+                self.messages.get_message(
+                    "available_commands", "Available commands:"
+                ),
+                "header",
+                formatter=self.output,
+            )
+
+            commands = self.commands.list_commands()
+            grouped: dict[str, list[str]] = {}
+            standalone: list[str] = []
+            for command in commands:
+                if "." in command:
+                    prefix = command.split(".")[0]
+                    grouped.setdefault(prefix, []).append(command)
+                else:
+                    standalone.append(command)
+
+            for command in sorted(standalone):
+                cmd_meta = self.commands.get_command(command)
+                if cmd_meta:
+                    help_text = cmd_meta.get("help", "No description")
+                    signature = self._format_command_signature(cmd_meta)
+                    aliases = cmd_meta.get("aliases", [])
+                    line = f"  {command:20} {help_text}"
+                    if signature:
+                        line += f"\n    {'':20} Usage: {command} {signature}"
+                    if aliases:
+                        line += f" (aliases: {', '.join(aliases)})"
+                    print(line)
+
+            if grouped:
+                print("")
+                echo("Command groups:", "header", formatter=self.output)
+                for prefix in sorted(grouped):
+                    cmds = grouped[prefix]
+                    print(
+                        f"  {prefix:20} ({len(cmds)} commands) - "
+                        f"use 'help {prefix}' for details"
+                    )
             return 0
 
         self.commands.register(
-            'help', help_command, help='Show help information',
-            arguments=[{'name': 'cmd', 'help': 'Command to show help for', 'type': str, 'optional': True}],
-            options=[], is_async=False
+            "help",
+            help_command,
+            help="Show help information",
+            arguments=[
+                {
+                    "name": "cmd",
+                    "help": "Command to show help for",
+                    "type": str,
+                    "optional": True,
+                }
+            ],
+            options=[],
+            is_async=False,
         )
 
         def version_command() -> int:
-            """Display application version"""
-            version: str = self.config.get('version', 'unknown')
-            echo(f"{self.name} version {version}", 'info', formatter=self.output)
+            """Display application version."""
+            version = self.config.get("version", "unknown")
+            echo(
+                f"{self.name} version {version}",
+                "info",
+                formatter=self.output,
+            )
             return 0
 
         self.commands.register(
-            'version', version_command, help='Show application version',
-            arguments=[], options=[], is_async=False
+            "version",
+            version_command,
+            help="Show application version",
+            arguments=[],
+            options=[],
+            is_async=False,
         )
 
         def exit_command() -> int:
-            """Exit the CLI application"""
+            """Exit the CLI application."""
             self._shutdown_requested = True
-            msg = self.messages.get_message('app_quit', 'Goodbye!')
-            echo(msg, 'info', formatter=self.output)
+            msg = self.messages.get_message("app_quit", "Goodbye!")
+            echo(msg, "info", formatter=self.output)
             return 0
 
         self.commands.register(
-            'exit', exit_command, help='Exit the application',
-            arguments=[], options=[], aliases=['quit', 'q'], is_async=False
+            "exit",
+            exit_command,
+            help="Exit the application",
+            arguments=[],
+            options=[],
+            aliases=["quit", "q"],
+            is_async=False,
         )
 
-    def command(self, name: Optional[str] = None, help: Optional[str] = None,
-                aliases: Optional[List[str]] = None) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator for defining command"""
-        from .decorators import command as cmd_decorator
-        return cmd_decorator(name, help, aliases)
+    def command(
+        self,
+        name: str | None = None,
+        help: str | None = None,
+        aliases: list[str] | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self._decorators.command(name, help, aliases)
 
-    def argument(self, name: str, help: Optional[str] = None,
-                 type: Type[Any] = str, optional: bool = False) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator for defining positional argument"""
-        from .decorators import argument as arg_decorator
-        return arg_decorator(name, help, type, optional)
+    def argument(
+        self,
+        name: str,
+        help: str | None = None,
+        type: Type[Any] = str,
+        optional: bool = False,
+        group: str | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self._decorators.argument(name, help, type, optional, group)
 
-    def option(self, name: str, short: Optional[str] = None, help: Optional[str] = None,
-               type: Type[Any] = str, default: Any = None,
-               is_flag: bool = False) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator for defining command option"""
-        from .decorators import option as opt_decorator
-        return opt_decorator(name, short, help, type, default, is_flag)
+    def option(
+        self,
+        name: str,
+        short: str | None = None,
+        help: str | None = None,
+        type: Type[Any] = str,
+        default: Any = _DEFAULT_SENTINEL,
+        default_factory: Callable[[], Any] | None = None,
+        is_flag: bool | None = None,
+        group: str | None = None,
+        exclusive_group: str | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        kwargs: dict[str, Any] = {
+            "short": short,
+            "help": help,
+            "type": type,
+            "default_factory": default_factory,
+            "is_flag": is_flag,
+            "group": group,
+            "exclusive_group": exclusive_group,
+        }
+        if default is not _DEFAULT_SENTINEL:
+            kwargs["default"] = default
+        return self._decorators.option(name, **kwargs)
 
-    def example(self, example_text: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        """Decorator for adding command example"""
-        from .decorators import example as ex_decorator
-        return ex_decorator(example_text)
+    def example(
+        self, example_text: str
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        return self._decorators.example(example_text)
 
-    def group(self, name: Optional[str] = None,
-              help: Optional[str] = None) -> Callable[[Type[Any]], Type[Any]]:
-        """Decorator for defining command group"""
-        from .decorators import group as group_decorator
-        return group_decorator(name, help)
+    def group(
+        self,
+        name: str | None = None,
+        help: str | None = None,
+    ) -> Callable[[Type[Any]], Type[Any]]:
+        return self._decorators.group(name, help)
 
-    def generate_from(self, obj: Union[Type[Any], object, Callable[..., Any]],
-                      safe_mode: bool = True) -> None:
-        """Generate CLI commands from object"""
-        self._logger.debug(f"Generating CLI from {obj}")
+    def before(
+        self, command_name: str
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a per-command pre-execution hook."""
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.hook_manager.add_per_command_hook(
+                command_name, "before", func
+            )
+            return func
+        return decorator
 
+    def after(
+        self, command_name: str
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a per-command post-execution hook."""
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.hook_manager.add_per_command_hook(
+                command_name, "after", func
+            )
+            return func
+        return decorator
+
+    def on_error_for(
+        self, command_name: str
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+        """Register a per-command error hook."""
+        def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            self.hook_manager.add_per_command_hook(
+                command_name, "error", func
+            )
+            return func
+        return decorator
+
+    def load_plugins(
+        self, group: str, fail_fast: bool = False
+    ) -> dict[str, bool]:
+        """Discover and invoke plugins via importlib.metadata entry points."""
+        from .plugins import load_plugins as _load_plugins
+        return _load_plugins(self, group, fail_fast=fail_fast)
+
+    def generate_completion(self, shell: str) -> str:
+        """Return shell completion script for bash/zsh/fish."""
+        from .completion import generate_completion as _gen
+        if not self._commands_registered:
+            self.register_all_commands()
+            self._commands_registered = True
+        return _gen(self, shell)
+
+    def install_completion(
+        self, shell: str, path: str | None = None
+    ) -> str:
+        """Write completion script to disk; returns the path written."""
+        script = self.generate_completion(shell)
+        if path is None:
+            home = os.path.expanduser("~")
+            defaults = {
+                "bash": os.path.join(
+                    home, ".bash_completion.d", f"{self.name}.bash"
+                ),
+                "zsh": os.path.join(
+                    home, ".zsh", "completions", f"_{self.name}"
+                ),
+                "fish": os.path.join(
+                    home, ".config", "fish", "completions",
+                    f"{self.name}.fish",
+                ),
+            }
+            if shell.lower() not in defaults:
+                raise ValueError(f"Unsupported shell: {shell}")
+            path = defaults[shell.lower()]
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(script)
+        return path
+
+    def generate_from(
+        self,
+        obj: Union[Type[Any], object, Callable[..., Any]],
+        safe_mode: bool = True,
+    ) -> None:
         if inspect.isclass(obj):
             try:
-                instance: Any = obj()
-                self._generate_from_instance(instance, safe_mode)
-            except Exception as e:
-                self._logger.error(f"Failed to instantiate class {obj}: {e}")
-                raise ValueError(f"Cannot instantiate class: {e}")
+                instance = obj()
+            except TypeError as exc:
+                if safe_mode:
+                    self._logger.warning(
+                        f"Skipping class {obj.__name__}: cannot instantiate "
+                        f"without arguments ({exc})"
+                    )
+                    return
+                raise ValueError(f"Cannot instantiate class: {exc}")
+            except Exception as exc:
+                self._logger.error(f"Failed to instantiate class {obj}: {exc}")
+                if safe_mode:
+                    return
+                raise ValueError(f"Cannot instantiate class: {exc}")
+            self._generate_from_instance(instance, safe_mode)
         elif inspect.isfunction(obj) or inspect.ismethod(obj):
             self._generate_from_function(obj, safe_mode)
-        elif hasattr(obj, '__dict__'):
+        elif hasattr(obj, "__dict__"):
             self._generate_from_instance(obj, safe_mode)
         else:
             raise ValueError(f"Cannot generate CLI from {type(obj)}")
 
-    def _generate_from_instance(self, instance: Any, safe_mode: bool) -> None:
-        """Generate commands from object instance"""
-        class_name: str = instance.__class__.__name__.lower()
-
+    def _generate_from_instance(
+        self, instance: Any, safe_mode: bool
+    ) -> None:
+        class_name = instance.__class__.__name__.lower()
         for attr_name in dir(instance):
-            if safe_mode and attr_name.startswith('_'):
+            if safe_mode and attr_name.startswith("_"):
                 continue
-
             try:
                 attr_obj = getattr(type(instance), attr_name, None)
                 if attr_obj is None or not callable(attr_obj):
                     continue
-
-                attr: Any = getattr(instance, attr_name)
+                attr = getattr(instance, attr_name)
                 if not callable(attr):
                     continue
-
-                command_name: str = f"{class_name}.{attr_name}"
+                command_name = f"{class_name}.{attr_name}"
                 self._auto_generate_command(command_name, attr)
-            except Exception as e:
-                self._logger.warning(f"Error processing {attr_name}: {e}")
+            except Exception as exc:
+                self._logger.warning(f"Error processing {attr_name}: {exc}")
 
-    def _generate_from_function(self, func: Callable[..., Any], safe_mode: bool) -> None:
-        """Generate command from single function"""
-        func_name: str = func.__name__
-        if safe_mode and func_name.startswith('_'):
+    def _generate_from_function(
+        self, func: Callable[..., Any], safe_mode: bool
+    ) -> None:
+        func_name = func.__name__
+        if safe_mode and func_name.startswith("_"):
             raise ValueError(f"Cannot expose private function: {func_name}")
         self._auto_generate_command(func_name, func)
 
-    def _auto_generate_command(self, name: str, func: Callable[..., Any]) -> None:
-        """Automatically generate and register command from function"""
-        sig: inspect.Signature = inspect.signature(func)
-        doc: Optional[str] = inspect.getdoc(func) or f"Command {name}"
+    def _auto_generate_command(
+        self, name: str, func: Callable[..., Any]
+    ) -> None:
+        from .decorators import _is_flag_param
 
-        arguments: List[Dict[str, Any]] = []
-        options: List[Dict[str, Any]] = []
+        sig = _cached_signature(func)
+        doc = inspect.getdoc(func) or f"Command {name}"
+
+        arguments: list[dict[str, Any]] = []
+        options: list[dict[str, Any]] = []
 
         for param_name, param in sig.parameters.items():
-            if param_name in ('self', 'cls'):
+            if param_name in ("self", "cls"):
                 continue
 
-            param_type: Type[Any] = (
-                param.annotation if param.annotation != inspect.Parameter.empty else str
+            param_type = (
+                param.annotation
+                if param.annotation is not inspect.Parameter.empty
+                else str
             )
 
-            if param.default != inspect.Parameter.empty:
-                is_flag = (
-                    isinstance(param.default, bool) or
-                    param_type is bool or
-                    (hasattr(param_type, '__origin__') and param_type.__origin__ is bool)
+            if param.default is not inspect.Parameter.empty:
+                options.append(
+                    {
+                        "name": param_name,
+                        "help": f"Option {param_name}",
+                        "type": param_type,
+                        "default": param.default,
+                        "is_flag": _is_flag_param(param_type, param.default),
+                    }
                 )
-                options.append({
-                    'name': param_name,
-                    'help': f"Option {param_name}",
-                    'type': param_type,
-                    'default': param.default,
-                    'is_flag': is_flag
-                })
             else:
-                arguments.append({
-                    'name': param_name,
-                    'help': f"Argument {param_name}",
-                    'type': param_type,
-                    'optional': False
-                })
+                arguments.append(
+                    {
+                        "name": param_name,
+                        "help": f"Argument {param_name}",
+                        "type": param_type,
+                        "optional": False,
+                    }
+                )
 
-        is_async = is_async_function(func)
         self.commands.register(
-            name, func, help=doc, arguments=arguments,
-            options=options, is_async=is_async
-        )
-        self._logger.info(
-            f"Auto-generated {'async' if is_async else 'sync'} command '{name}'"
+            name,
+            func,
+            help=doc,
+            arguments=arguments,
+            options=options,
+            is_async=is_async_function(func),
         )
 
     def register_all_commands(self) -> int:
-        """Register all decorator-defined commands"""
-        self._logger.debug("Registering all decorated commands")
-        count = register_commands(self)
-        self._logger.info(f"Registered {count} decorator-defined commands")
+        count = register_commands(
+            self, include_default=self._include_default_registry
+        )
+        self._logger.info(
+            f"Registered {count} decorator-defined commands"
+        )
         return count
 
+    @staticmethod
+    def _extract_config_file_arg(
+        args: list[str],
+    ) -> tuple[str | None, list[str]]:
+        """Pull --config-file value out of args before normal parsing."""
+        out: list[str] = []
+        config_file: str | None = None
+        i = 0
+        while i < len(args):
+            tok = args[i]
+            if tok == "--config-file":
+                if i + 1 >= len(args):
+                    raise ValueError(
+                        "--config-file requires a path argument"
+                    )
+                config_file = args[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--config-file="):
+                config_file = tok.split("=", 1)[1]
+                i += 1
+                continue
+            out.append(tok)
+            i += 1
+        return config_file, out
+
+    def _reload_config_from(self, path: str) -> None:
+        """Replace current config provider with one loaded from path."""
+        default_config = self._build_default_config(self.name)
+        self.config = JsonConfigProvider(
+            path,
+            default_config=default_config,
+            schema=DEFAULT_CONFIG_SCHEMA,
+        )
+        self.messages = ConfigBasedMessageProvider(self.config)
+        self.executor.messages = self.messages
+
     async def run_interactive(self) -> int:
-        """Run CLI in interactive REPL mode"""
         if not self._commands_registered:
             self.register_all_commands()
             self._commands_registered = True
 
         self._running = True
         shell = InteractiveShell(self)
-
         try:
             exit_code = await shell.run()
             self.exit_code = exit_code
             return exit_code
         except asyncio.CancelledError:
-            self._logger.info("Interactive shell cancelled")
             self.exit_code = 130
             raise
         finally:
             self._running = False
             await self._run_cleanup_callbacks()
-            try:
-                self.config.save()
-                self._logger.debug("Configuration saved on exit")
-            except Exception as e:
-                self._logger.error(f"Failed to save configuration: {e}")
 
-    async def run_async(self, args: Optional[List[str]] = None, interactive: bool = False) -> int:
-        """Run CLI application asynchronously"""
-        if interactive:
-            return await self.run_interactive()
-
+    async def run_async(self, args: list[str] | None = None) -> int:
         if args is None:
             args = sys.argv[1:]
 
-        if '--help' in args or '-h' in args:
-            if not args or args[0] in ('--help', '-h'):
-                if not self._commands_registered:
-                    self.register_all_commands()
-                    self._commands_registered = True
-
-                echo(self.config.get('welcome_message', f"Welcome to {self.name}"),
-                    'info', formatter=self.output)
-                print("")
-                echo(self.messages.get_message('available_commands', 'Available commands:'),
-                    'header', formatter=self.output)
-                commands = self.commands.list_commands()
-                for command in sorted(commands):
-                    cmd_meta = self.commands.get_command(command)
-                    if cmd_meta:
-                        help_text = cmd_meta.get('help', 'No description')
-                        signature = self._format_command_signature(cmd_meta)
-                        aliases = cmd_meta.get('aliases', [])
-
-                        line = f"  {command:20} {help_text}"
-                        if signature:
-                            line += f"\n    {'':20} Usage: {command} {signature}"
-                        if aliases:
-                            alias_str = f" (aliases: {', '.join(aliases)})"
-                            line += alias_str
-                        print(line)
-                print("")
-                echo("Use '<command> --help' for more information about a command.",
-                    'info', formatter=self.output)
-                return 0
+        try:
+            config_file, args = self._extract_config_file_arg(args)
+        except ValueError as exc:
+            echo(f"Error: {exc}", "error", formatter=self.output)
+            self.exit_code = 1
+            return 1
+        if config_file:
+            try:
+                self._reload_config_from(config_file)
+            except Exception as exc:
+                echo(
+                    f"Failed to load config from {config_file}: {exc}",
+                    "error",
+                    formatter=self.output,
+                )
+                self.exit_code = 1
+                return 1
 
         if not self._commands_registered:
             self.register_all_commands()
@@ -1074,62 +1477,78 @@ class CLI:
         if not args:
             return await self.run_interactive()
 
-        self._running = True
-
         try:
             args = await self.hook_manager.on_before_parse(args)
-            parsed: Dict[str, Any] = self.parser.parse(args)
+            parsed = self.parser.parse(args)
             parsed = await self.hook_manager.on_after_parse(parsed)
 
-            command: Optional[str] = parsed.get('command')
-
+            command = parsed.get("command")
             if not command:
-                echo(self.config.get('welcome_message', f"Welcome to {self.name}"),
-                    'info', formatter=self.output)
-                echo(self.config.get('help_hint', "Type 'help' for commands"),
-                    'info', formatter=self.output)
+                echo(
+                    "No command specified. Use 'help' for available commands.",
+                    "error",
+                    formatter=self.output,
+                )
+                self.exit_code = 1
+                return 1
+
+            if parsed.get("_cli_show_help", False):
+                help_text = self.parser.generate_help(command)
+                echo(help_text, "info", formatter=self.output)
+                self.exit_code = 0
                 return 0
 
-            if parsed.get('_cli_show_help', False):
-                help_text: str = self.parser.generate_help(command)
-                echo(help_text, 'info', formatter=self.output)
-                return 0
+            command_kwargs = {
+                k: v
+                for k, v in parsed.items()
+                if k != "command" and not k.startswith("_cli_")
+            }
 
-            command_kwargs = {k: v for k, v in parsed.items()
-                            if k != 'command' and not k.startswith('_cli_')}
-            exit_code: int = await self.executor.execute(command, self, **command_kwargs)
-            self.exit_code = exit_code
-            return exit_code
+            try:
+                exit_code = await self.executor.execute(
+                    command, self, **command_kwargs
+                )
+                self.exit_code = exit_code
+                return exit_code
+            except CommandExecutionError:
+                self.exit_code = 1
+                return 1
 
-        except asyncio.CancelledError:
-            self._logger.info("Application cancelled")
-            self.exit_code = 130
-            raise
-        except ValueError as e:
-            echo(f"Error: {e}", 'error', formatter=self.output)
+        except ValueError as exc:
+            echo(f"Error: {exc}", "error", formatter=self.output)
             self.exit_code = 1
             return 1
         except KeyboardInterrupt:
-            self._logger.info("Interrupted by user")
+            echo("\nInterrupted by user", "warning", formatter=self.output)
             self.exit_code = 130
             return 130
-        except CommandExecutionError:
-            self.exit_code = 1
-            return 1
-        except Exception as e:
-            self._logger.error(f"Unexpected error: {e}", exc_info=True)
-            echo(f"Unexpected error: {e}", 'error', formatter=self.output)
+        except asyncio.CancelledError:
+            self.exit_code = 130
+            raise
+        except Exception as exc:
+            self._logger.error(f"Unexpected error: {exc}", exc_info=True)
+            echo(f"Unexpected error: {exc}", "error", formatter=self.output)
             self.exit_code = 1
             return 1
         finally:
-            self._running = False
             await self._run_cleanup_callbacks()
-            try:
-                self.config.save()
-                self._logger.debug("Configuration saved on exit")
-            except Exception as e:
-                self._logger.error(f"Failed to save configuration: {e}")
 
-    def run(self, args: Optional[List[str]] = None, interactive: bool = False) -> int:
-        """Run CLI application"""
-        return asyncio.run(self.run_async(args, interactive))
+    def run(self, args: list[str] | None = None) -> int:
+        try:
+            return asyncio.run(self.run_async(args))
+        except KeyboardInterrupt:
+            echo("\nInterrupted by user", "warning", formatter=self.output)
+            return 130
+
+
+__all__ = [
+    "CLI",
+    "CLIError",
+    "CommandExecutionError",
+    "MiddlewarePipeline",
+    "HookManager",
+    "CommandExecutor",
+    "InteractiveShell",
+    "DEFAULT_CONFIG_SCHEMA",
+    "cli_context",
+]
