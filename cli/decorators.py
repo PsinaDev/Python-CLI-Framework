@@ -23,7 +23,15 @@ import inspect
 import logging
 import threading
 import warnings
-from typing import Any, Callable, Type, TypeVar, get_args, get_origin
+from typing import (
+    Any,
+    Callable,
+    Type,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+)
 from weakref import WeakKeyDictionary, WeakSet
 
 from .interfaces import RESERVED_NAMES
@@ -63,6 +71,35 @@ def _is_flag_param(param_type: Any, default: Any) -> bool:
         if len(non_none) == 1 and non_none[0] is bool:
             return True
     return False
+
+
+def dest_name(name: str) -> str:
+    """Python identifier for a CLI name: ``dry-run`` -> ``dry_run``."""
+    return name.replace("-", "_")
+
+
+def resolve_param_types(func: Callable[..., Any]) -> dict[str, Any]:
+    """Real annotation objects, also under ``from __future__ import annotations``.
+
+    When the hints cannot be evaluated together (e.g. one of them refers to a
+    name local to the defining function), each one is evaluated on its own
+    and unresolvable ones stay as raw strings.
+    """
+    target = _unwrap(func)
+    try:
+        return get_type_hints(target)
+    except Exception:
+        pass
+    namespace = dict(getattr(target, "__globals__", {}) or {})
+    hints: dict[str, Any] = {}
+    for name, hint in (getattr(target, "__annotations__", {}) or {}).items():
+        if isinstance(hint, str):
+            try:
+                hint = eval(hint, namespace)  # noqa: S307 - annotation text
+            except Exception:
+                pass
+        hints[name] = hint
+    return hints
 
 
 def _validate_name_not_reserved(name: str, context: str) -> None:
@@ -154,6 +191,7 @@ def _ensure_command_metadata(
     cmd_name: str = func.__name__
     help_text: str = inspect.getdoc(func) or f"Command {cmd_name}"
     sig: inspect.Signature = inspect.signature(func)
+    hints = resolve_param_types(func)
 
     arguments: list[dict[str, Any]] = []
     options: list[dict[str, Any]] = []
@@ -161,14 +199,17 @@ def _ensure_command_metadata(
     for param_name, param in sig.parameters.items():
         if param_name in ("self", "cls"):
             continue
+        if param.kind in (
+            inspect.Parameter.VAR_POSITIONAL,
+            inspect.Parameter.VAR_KEYWORD,
+        ):
+            continue
         _validate_name_not_reserved(param_name, "parameter")
 
-        param_type: Any = (
-            param.annotation
-            if param.annotation is not inspect.Parameter.empty
-            else str
-        )
+        param_type: Any = hints.get(param_name, str)
 
+        # "auto" marks entries inferred from the signature: explicit
+        # @argument/@option may replace them without a warning.
         if param.default is not inspect.Parameter.empty:
             options.append(
                 {
@@ -180,6 +221,7 @@ def _ensure_command_metadata(
                     "is_flag": _is_flag_param(param_type, param.default),
                     "group": None,
                     "exclusive_group": None,
+                    "auto": True,
                 }
             )
         else:
@@ -190,6 +232,7 @@ def _ensure_command_metadata(
                     "type": param_type,
                     "optional": False,
                     "group": None,
+                    "auto": True,
                 }
             )
 
@@ -248,7 +291,13 @@ def _make_argument(registry: CommandMetadataRegistry):
         type: Type[Any] = str,
         optional: bool = False,
         group: str | None = None,
+        nargs: str | None = None,
     ) -> Callable[[F], F]:
+        if nargs not in (None, "?", "*", "+"):
+            raise ValueError(
+                f"nargs must be one of None, '?', '*', '+', got: {nargs!r}"
+            )
+
         def decorator(func: F) -> F:
             if not callable(func):
                 raise TypeError("@argument can only be applied to callable")
@@ -259,22 +308,23 @@ def _make_argument(registry: CommandMetadataRegistry):
             arguments = list(metadata.get("arguments", []))
             options = list(metadata.get("options", []))
 
-            if name in [a["name"] for a in arguments]:
-                arguments = [a for a in arguments if a["name"] != name]
-            if name in [o["name"] for o in options]:
-                warnings.warn(
-                    f"Option '{name}' being redefined as argument in command "
-                    f"'{metadata['name']}'",
-                    stacklevel=2,
-                )
-                options = [o for o in options if o["name"] != name]
+            arguments = [a for a in arguments if a["name"] != name]
+            for o in options:
+                if o["name"] == name and not o.get("auto"):
+                    warnings.warn(
+                        f"Option '{name}' being redefined as argument in command "
+                        f"'{metadata['name']}'",
+                        stacklevel=2,
+                    )
+            options = [o for o in options if o["name"] != name]
 
             arguments.append(
                 {
                     "name": name,
                     "help": help or f"Argument {name}",
                     "type": type,
-                    "optional": optional,
+                    "optional": optional or nargs in ("?", "*"),
+                    "nargs": nargs,
                     "group": group,
                 }
             )
@@ -349,19 +399,17 @@ def _make_option(registry: CommandMetadataRegistry):
                 options, normalized_short, normalized_name, metadata["name"]
             )
 
-            if normalized_name in [o["name"] for o in options]:
-                options = [
-                    o for o in options if o["name"] != normalized_name
-                ]
-            if normalized_name in [a["name"] for a in arguments]:
-                warnings.warn(
-                    f"Argument '{normalized_name}' being redefined as option in "
-                    f"command '{metadata['name']}'",
-                    stacklevel=2,
-                )
-                arguments = [
-                    a for a in arguments if a["name"] != normalized_name
-                ]
+            # "--dry-run" and parameter dry_run are the same option
+            dest = dest_name(normalized_name)
+            options = [o for o in options if dest_name(o["name"]) != dest]
+            for a in arguments:
+                if a["name"] == dest and not a.get("auto"):
+                    warnings.warn(
+                        f"Argument '{normalized_name}' being redefined as option in "
+                        f"command '{metadata['name']}'",
+                        stacklevel=2,
+                    )
+            arguments = [a for a in arguments if a["name"] != dest]
 
             resolved_default: Any = (
                 None if default is _MISSING else default

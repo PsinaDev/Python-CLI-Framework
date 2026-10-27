@@ -10,11 +10,21 @@ import enum
 import json
 import logging
 import threading
+import types
 from collections import OrderedDict
 from typing import Any, Callable, Type, get_args, get_origin
 from typing import Union as _Union
 
-from .interfaces import ArgumentParser, CommandRegistry, RESERVED_NAMES
+from .decorators import dest_name
+from .interfaces import (
+    ArgumentParser,
+    CommandRegistry,
+    MessageProvider,
+    RESERVED_NAMES,
+)
+from .messages import builtin_message
+
+_UNION_ORIGINS: tuple[Any, ...] = (_Union, types.UnionType)
 
 
 class _TrieNode:
@@ -263,7 +273,7 @@ def validate_type(
         if origin in (list, dict, tuple):
             return origin
 
-        if origin is _Union:
+        if origin in _UNION_ORIGINS:
             args = get_args(param_type)
             non_none = [a for a in args if a is not type(None)]
             if len(non_none) == 1:
@@ -322,6 +332,7 @@ class EnhancedArgumentParser(ArgumentParser):
         self,
         command_registry: CommandRegistry,
         max_cache_size: int = 128,
+        message_provider: MessageProvider | None = None,
     ) -> None:
         self._command_registry: CommandRegistry = command_registry
         self._max_cache_size: int = max_cache_size
@@ -331,11 +342,21 @@ class EnhancedArgumentParser(ArgumentParser):
         self._logger: logging.Logger = logging.getLogger(
             "cliframework.argument_parser"
         )
+        self._messages: MessageProvider | None = message_provider
+        self._cache_language: str | None = None
 
         if hasattr(command_registry, "set_parser_cache_invalidator"):
             command_registry.set_parser_cache_invalidator(
                 self.invalidate_command
             )
+
+    def set_message_provider(self, provider: MessageProvider | None) -> None:
+        """Use ``provider`` for help texts; cached parsers are rebuilt."""
+        self._messages = provider
+        self.clear_cache()
+
+    def _t(self, key: str, **kwargs: Any) -> str:
+        return builtin_message(self._messages, key, **kwargs)
 
     def parse(self, args: list[str]) -> dict[str, Any]:
         if not args:
@@ -363,8 +384,7 @@ class EnhancedArgumentParser(ArgumentParser):
                 result["_cli_show_help"] = True
                 return result
             raise ValueError(
-                f"Invalid arguments for command '{command}': {exc}.\n"
-                f"Use '{command} --help' for detailed help."
+                self._t("invalid_arguments", command=command, error=exc)
             )
 
         if getattr(parsed_args, "_cli_help", False):
@@ -379,9 +399,10 @@ class EnhancedArgumentParser(ArgumentParser):
             if factory is None:
                 continue
             opt_name = opt_meta["name"]
-            if result.get(opt_name) is None:
+            opt_dest = dest_name(opt_name)
+            if result.get(opt_dest) is None:
                 try:
-                    result[opt_name] = factory()
+                    result[opt_dest] = factory()
                 except Exception as exc:
                     raise ValueError(
                         f"default_factory for option '--{opt_name}' raised: {exc}"
@@ -392,7 +413,7 @@ class EnhancedArgumentParser(ArgumentParser):
     def generate_help(self, command: str) -> str:
         command_meta = self._command_registry.get_command(command)
         if not command_meta:
-            return f"Unknown command: {command}"
+            return self._t("unknown_command_help", command=command)
 
         parser = self._get_parser_for_command(command, command_meta)
         help_text = parser.format_help()
@@ -403,15 +424,13 @@ class EnhancedArgumentParser(ArgumentParser):
             o.get("is_flag") and o.get("default") is True
             for o in command_meta.get("options", [])
         ):
-            notes.append(
-                "  - Flags marked as 'enabled by default' use --no-<n> to disable"
-            )
+            notes.append("  - " + self._t("help_note_no_flags"))
 
         if any(
             o.get("type") in (list, dict, tuple)
             for o in command_meta.get("options", [])
         ):
-            notes.append("\nType Conversion:")
+            notes.append("\n" + self._t("help_type_conversion"))
             notes.append("  list:  JSON: '[\"a\",\"b\"]' or CSV: 'a,b,c'")
             notes.append("  dict:  JSON: '{\"k\":\"v\"}' or key=value: 'k1=v1,k2=v2'")
             notes.append("  tuple: JSON: '[x,y]' (CSV not recommended)")
@@ -424,17 +443,19 @@ class EnhancedArgumentParser(ArgumentParser):
             and issubclass(o["type"], enum.Enum)
         ]
         if enum_options:
-            notes.append("\nEnum Options:")
+            notes.append("\n" + self._t("help_enum_options"))
             for o in enum_options:
                 values = ", ".join(m.name for m in o["type"])
                 notes.append(f"  --{o['name']}: {values}")
 
         if notes:
-            help_text += "\nNotes:\n" + "\n".join(notes) + "\n"
+            help_text += (
+                "\n" + self._t("help_notes") + "\n" + "\n".join(notes) + "\n"
+            )
 
         examples = command_meta.get("examples", [])
         if examples:
-            help_text += "\nExamples:\n"
+            help_text += "\n" + self._t("help_examples") + "\n"
             for ex in examples:
                 help_text += f"  {ex}\n"
 
@@ -442,6 +463,7 @@ class EnhancedArgumentParser(ArgumentParser):
 
     def clear_cache(self) -> None:
         self._parser_cache.clear()
+        self._cache_language = None
         self._logger.debug("Parser cache cleared")
 
     def invalidate_command(self, command: str) -> None:
@@ -466,6 +488,13 @@ class EnhancedArgumentParser(ArgumentParser):
         command: str,
         command_meta: dict[str, Any],
     ) -> argparse.ArgumentParser:
+        # Help texts are baked into parsers: drop them on a language switch.
+        if self._messages is not None:
+            language = self._messages.get_current_language()
+            if language != self._cache_language:
+                self._parser_cache.clear()
+                self._cache_language = language
+
         if command in self._parser_cache:
             self._parser_cache.move_to_end(command)
             return self._parser_cache[command]
@@ -481,39 +510,48 @@ class EnhancedArgumentParser(ArgumentParser):
         command: str,
         command_meta: dict[str, Any],
     ) -> argparse.ArgumentParser:
+        usage_prefix = self._t("help_usage")
+
+        class _Formatter(argparse.RawDescriptionHelpFormatter):
+            def add_usage(self, usage, actions, groups, prefix=None):  # type: ignore[override]
+                super().add_usage(usage, actions, groups, prefix or usage_prefix)
+
         parser = _SilentArgumentParser(
             prog=command,
             description=command_meta.get("help", ""),
             add_help=False,
-            formatter_class=argparse.RawDescriptionHelpFormatter,
+            formatter_class=_Formatter,
         )
+        parser._positionals.title = self._t("help_positionals")
+        parser._optionals.title = self._t("help_options")
 
         parser.add_argument(
             "--help",
             "-h",
             action="store_true",
             dest="_cli_help",
-            help="Show this help message",
+            help=self._t("help_show_help"),
         )
 
         arguments = command_meta.get("arguments", [])
-        optional_count = sum(1 for a in arguments if a.get("optional"))
-        if optional_count > 1:
-            raise ValueError(
-                f"Command '{command}' has {optional_count} optional positional "
-                f"arguments. Only one is allowed at the end"
-            )
+        # A positional that may be absent ("?", "*") or takes several
+        # values ("+") must be the last one, and only one is allowed.
+        def _is_open(a: dict[str, Any]) -> bool:
+            return bool(a.get("optional")) or a.get("nargs") in ("?", "*", "+")
 
-        found_optional = False
-        for i, arg_meta in enumerate(arguments):
-            is_optional = arg_meta.get("optional", False)
-            if found_optional and not is_optional:
+        open_count = sum(1 for a in arguments if _is_open(a))
+        if open_count > 1:
+            raise ValueError(
+                f"Command '{command}' has {open_count} optional or variadic "
+                f"positional arguments. Only one is allowed at the end"
+            )
+        for i, arg_meta in enumerate(arguments[:-1]):
+            if _is_open(arg_meta):
                 raise ValueError(
-                    f"Command '{command}': Optional positional '{arguments[i - 1]['name']}' "
-                    f"must come after all required arguments"
+                    f"Command '{command}': optional or variadic positional "
+                    f"'{arg_meta['name']}' must come after all required "
+                    f"arguments, before '{arguments[i + 1]['name']}'"
                 )
-            if is_optional:
-                found_optional = True
 
         named_arg_groups: dict[str, Any] = {}
         for arg_meta in arguments:
@@ -528,8 +566,11 @@ class EnhancedArgumentParser(ArgumentParser):
                 "type": self._get_type_converter(arg_type),
                 "help": arg_meta.get("help", ""),
             }
-            if arg_meta.get("optional"):
-                kwargs["nargs"] = "?"
+            nargs = arg_meta.get("nargs")
+            if nargs is None and arg_meta.get("optional"):
+                nargs = "?"
+            if nargs is not None:
+                kwargs["nargs"] = nargs
 
             group_name = arg_meta.get("group")
             target = parser
@@ -606,27 +647,27 @@ class EnhancedArgumentParser(ArgumentParser):
             if opt_default is True:
                 no_names = [f"--no-{opt_name}"]
                 help_text = (
-                    f"{opt_help} (enabled by default, use --no-{opt_name} to disable)"
+                    self._t("help_flag_on", help=opt_help, name=opt_name)
                     if opt_help.strip()
-                    else f"Disable {opt_name} (enabled by default)"
+                    else self._t("help_flag_on_bare", name=opt_name)
                 )
                 target.add_argument(
                     *no_names,
                     action="store_false",
-                    dest=opt_name,
+                    dest=dest_name(opt_name),
                     default=True,
                     help=help_text,
                 )
             else:
                 help_text = (
-                    f"{opt_help} (disabled by default)"
+                    self._t("help_flag_off", help=opt_help, name=opt_name)
                     if opt_help.strip()
-                    else f"Enable {opt_name}"
+                    else self._t("help_flag_off_bare", name=opt_name)
                 )
                 target.add_argument(
                     *names,
                     action="store_true",
-                    dest=opt_name,
+                    dest=dest_name(opt_name),
                     default=False,
                     help=help_text,
                 )
@@ -639,13 +680,15 @@ class EnhancedArgumentParser(ArgumentParser):
             if examples and opt_help:
                 enhanced_help = f"{opt_help} {examples}"
             elif examples:
-                enhanced_help = f"Value for {opt_name} {examples}"
+                enhanced_help = self._t(
+                    "help_value_for", name=opt_name, examples=examples
+                )
         elif isinstance(opt_type, type) and issubclass(opt_type, enum.Enum):
             values = ", ".join(m.name for m in opt_type)
             enhanced_help = (
-                f"{opt_help} (choices: {values})"
+                self._t("help_choices", help=opt_help, values=values)
                 if opt_help
-                else f"Choices: {values}"
+                else self._t("help_choices_bare", values=values)
             )
 
         target.add_argument(

@@ -126,15 +126,29 @@ cli.argument(
     type: type = str,
     optional: bool = False,
     group: str | None = None,
+    nargs: str | None = None,      # None, "?", "*", "+"
 )
 ```
 
 Поддерживаемые `type`: `str`, `int`, `float`, `bool`, `list`, `dict`,
-`tuple`, наследники `Enum`, `Optional[T]`. `list` и `dict` принимают
-JSON или упрощённый синтаксис `key=value` / CSV в командной строке.
+`tuple`, наследники `Enum`, `Optional[T]` / `T | None`. `list` и `dict`
+принимают JSON или упрощённый синтаксис `key=value` / CSV в командной строке.
 
 `optional=True` делает позиционный аргумент опциональным; такой аргумент
 обязан идти последним. `group` — display-only метка.
+
+`nargs` собирает несколько значений в список: `"+"` — одно или больше,
+`"*"` — ноль или больше (пусто → `[]`), `"?"` — то же, что
+`optional=True`. `type` при этом задаёт тип **элемента**. Такой
+аргумент тоже должен быть последним и единственным открытым:
+
+```python
+@cli.command()
+@cli.argument("modules", nargs="+")
+@cli.argument("version")
+def install(version: str, modules: list) -> int: ...
+# app install 6.10.3 multimedia serialport
+```
 
 ### `@cli.option`
 
@@ -153,6 +167,7 @@ cli.option(
 ```
 
 - `name` принимает `"--verbose"` или `"verbose"`; `short` — `"-v"` или `"v"` (один символ).
+- Дефис в имени соответствует подчёркиванию в параметре: `--dry-run` → `dry_run`.
 - `is_flag` автоматически становится `True` для `bool`-типа или `bool`-default.
 - `default_factory` создаёт свежее значение на каждый парс — нужно для дефолтов-`list`/`dict`, чтобы они не шарились между запусками.
 - `exclusive_group`: опции с одинаковой меткой становятся взаимоисключающими на уровне парсера.
@@ -300,6 +315,16 @@ Thread-safe JSON-хранилище с file lock. Методы интерфей�
 - `save()` — атомарная запись на диск
 - `get_all()` — полный snapshot
 
+### `MemoryConfigProvider`
+
+```python
+MemoryConfigProvider(default_config: dict[str, Any] | None = None)
+```
+
+Тот же иерархический API, но всё в памяти: `save()` ничего не делает,
+файл не создаётся. Короткий путь — `CLI(name, persist_config=False)`:
+без этого флага `CLI` по умолчанию заводит `~/.config/<name>/<name>.json`.
+
 ### Иерархические ключи
 
 ```python
@@ -393,6 +418,31 @@ cli.messages.set_language("ru")
 
 Плейсхолдеры формата подставляются через safe formatter, который
 игнорирует отсутствующие ключи вместо исключения. Ошибки: `MessageError`.
+Предупреждение об отсутствующем ключе пишется только если не передан
+`default`.
+
+### Строки самого фреймворка
+
+Справка (`help`, `<команда> --help`), описания встроенных команд и
+сообщения об ошибках разбора берутся через тот же провайдер по ключам
+из `cli.BUILTIN_MESSAGES` (английский — запасной вариант). В комплекте
+есть русский набор `BUILTIN_MESSAGES_RU`; включить его:
+
+```python
+cli = CLI(name="myapp", language="ru")
+```
+
+`language` доустанавливает встроенные строки языка, не трогая уже
+заданные в конфиге переводы, и переключает язык. Свой перевод любой
+строки — тем же `add_language`:
+
+```python
+cli.messages.add_language("ru", {"help_examples": "Как вызывать:"})
+```
+
+Заголовки argparse (`usage:`, `positional arguments`, `options`) тоже
+переводятся: ключи `help_usage`, `help_positionals`, `help_options`.
+Кэш парсеров сбрасывается сам при смене языка.
 
 ---
 
@@ -627,8 +677,22 @@ CLI(
     auto_logging_middleware: bool = False,
     include_default_registry: bool = True,
     shell_posix: bool | None = None,
+    persist_config: bool = True,
+    language: str | None = None,
+    utf8_stdio: bool = True,
 )
 ```
+
+`persist_config=False` — конфиг в памяти (`MemoryConfigProvider`), на диск
+ничего не пишется; явный `config_path` или `config_provider` важнее.
+`language` — язык сообщений и справки (см. «Строки самого фреймворка»).
+`utf8_stdio` — на Windows, если stdout/stderr перенаправлены в файл или
+pipe, переключить их на UTF-8 (иначе Python пишет в ANSI-кодировке и
+кириллица ломается). Консоль не трогается.
+
+Аннотации типов читаются через `typing.get_type_hints`, поэтому
+`from __future__ import annotations` в модуле с командами не мешает
+определять флаги и типы.
 
 `shell_posix` управляет тем, как REPL разбивает строки ввода на токены.
 `True` — режим `shlex` POSIX (кавычки интерпретируются и снимаются).
@@ -684,12 +748,14 @@ CommandMetadataRegistry, BoundDecorators, RESERVED_NAMES
 ConfigProvider, MessageProvider, OutputFormatter, CommandRegistry,
 ArgumentParser, CommandHandler, Middleware, Hook
 
-JsonConfigProvider, ConfigError, ConfigValidationError, ConfigIOError,
-ConfigLockError, sanitize_for_logging, EnvOverlayConfigProvider
+JsonConfigProvider, MemoryConfigProvider, ConfigError,
+ConfigValidationError, ConfigIOError, ConfigLockError,
+sanitize_for_logging, EnvOverlayConfigProvider
 
-ConfigBasedMessageProvider, MessageError
+ConfigBasedMessageProvider, MessageError, BUILTIN_MESSAGES,
+BUILTIN_MESSAGES_RU, BUILTIN_TRANSLATIONS
 
-TerminalOutputFormatter, echo, style, progress_bar, table
+TerminalOutputFormatter, configure_stdio, echo, style, progress_bar, table
 
 CommandRegistryImpl, EnhancedArgumentParser
 
@@ -707,7 +773,7 @@ __version__, get_version, get_version_tuple
 ### Цвета не отображаются
 
 Вывод определён как не-TTY (пайп или редирект). Принудительно включить
-цвета можно через свой `TerminalOutputFormatter` с `force_color=True`,
+цвета можно через свой `TerminalOutputFormatter(use_colors=True)` или переменную `FORCE_COLOR=1`,
 либо вручную выводить ANSI через `style()`.
 
 ### Tab-completion не работает в REPL

@@ -53,6 +53,9 @@ def add(a: int, b: int) -> int: ...
 ## Что умеет
 
 - Sync и async-обработчики команд
+- Позиционные аргументы со списком значений (`nargs="+"` / `"*"`)
+- Конфиг в памяти без файлов (`CLI(..., persist_config=False)`)
+- Справка и встроенные сообщения на русском (`CLI(..., language="ru")`)
 - Группы команд через классы (`@cli.group` → точечные имена `db.init`)
 - Middleware-цепочка + глобальный `Hook` + per-command `before` / `after` / `on_error_for`
 - `JsonConfigProvider` (file lock, иерархические ключи, опциональная JSON-schema валидация)

@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable, Type, Union
 from weakref import WeakKeyDictionary
 
 from .command import CommandRegistryImpl, EnhancedArgumentParser
-from .config import JsonConfigProvider
+from .config import JsonConfigProvider, MemoryConfigProvider
 from .decorators import (
     BoundDecorators,
     CommandMetadataRegistry,
@@ -34,8 +34,12 @@ from .interfaces import (
     MessageProvider,
     OutputFormatter,
 )
-from .messages import ConfigBasedMessageProvider
-from .output import TerminalOutputFormatter, echo
+from .messages import (
+    BUILTIN_TRANSLATIONS,
+    ConfigBasedMessageProvider,
+    builtin_message,
+)
+from .output import TerminalOutputFormatter, configure_stdio, echo
 
 _DEFAULT_SENTINEL: Any = object()
 
@@ -732,7 +736,12 @@ class CLI:
         auto_logging_middleware: bool = False,
         include_default_registry: bool = True,
         shell_posix: bool | None = None,
+        persist_config: bool = True,
+        language: str | None = None,
+        utf8_stdio: bool = True,
     ) -> None:
+        if utf8_stdio:
+            configure_stdio()
         self._setup_logging(log_level)
         self._logger: logging.Logger = logging.getLogger(
             f"cliframework.app.{name}"
@@ -747,23 +756,27 @@ class CLI:
         self._registered_funcs: WeakSet = WeakSet()
 
         if config_provider is None:
-            if config_path is None:
-                config_dir = os.path.expanduser(f"~/.config/{name}")
-                os.makedirs(config_dir, exist_ok=True)
-                config_path = os.path.join(config_dir, f"{name}.json")
-
             default_config = self._build_default_config(name)
-            schema = config_schema or DEFAULT_CONFIG_SCHEMA
-            config_provider = JsonConfigProvider(
-                config_path,
-                default_config=default_config,
-                schema=schema,
-            )
+            if not persist_config and config_path is None:
+                config_provider = MemoryConfigProvider(default_config)
+            else:
+                if config_path is None:
+                    config_dir = os.path.expanduser(f"~/.config/{name}")
+                    os.makedirs(config_dir, exist_ok=True)
+                    config_path = os.path.join(config_dir, f"{name}.json")
+                schema = config_schema or DEFAULT_CONFIG_SCHEMA
+                config_provider = JsonConfigProvider(
+                    config_path,
+                    default_config=default_config,
+                    schema=schema,
+                )
 
         self.config: ConfigProvider = config_provider
         self.messages: MessageProvider = (
             message_provider or ConfigBasedMessageProvider(self.config)
         )
+        if language is not None:
+            self._apply_language(language)
         self.output: OutputFormatter = (
             output_formatter or TerminalOutputFormatter()
         )
@@ -771,7 +784,10 @@ class CLI:
             command_registry or CommandRegistryImpl()
         )
         self.parser: ArgumentParser = (
-            argument_parser or EnhancedArgumentParser(self.commands)
+            argument_parser
+            or EnhancedArgumentParser(
+                self.commands, message_provider=self.messages
+            )
         )
 
         self.pipeline = MiddlewarePipeline()
@@ -803,6 +819,21 @@ class CLI:
 
         if auto_logging_middleware:
             self.use_logging_middleware()
+
+    def _apply_language(self, language: str) -> None:
+        """Switch to ``language``, installing the built-in framework strings
+        for it (without overriding translations already in the config)."""
+        pack = BUILTIN_TRANSLATIONS.get(language)
+        if pack and hasattr(self.messages, "add_language") and hasattr(
+            self.messages, "get_available_languages"
+        ):
+            existing = self.config.get(f"messages.{language}", {}) or {}
+            missing = {k: v for k, v in pack.items() if k not in existing}
+            available = self.messages.get_available_languages()
+            if missing or language not in available:
+                self.messages.add_language(language, missing)
+        if self.messages.get_current_language() != language:
+            self.messages.set_language(language)
 
     def _build_default_config(self, name: str) -> dict[str, Any]:
         return {
@@ -964,14 +995,49 @@ class CLI:
     def enable_readline(self, enable: bool = True) -> None:
         self._use_readline = enable
 
+    def _t(self, key: str, **kwargs: Any) -> str:
+        """Framework string in the current language (see BUILTIN_MESSAGES)."""
+        return builtin_message(self.messages, key, **kwargs)
+
+    _BUILTIN_HELP_KEYS: dict[str, str] = {
+        "help": "cmd_help",
+        "version": "cmd_version",
+        "exit": "cmd_exit",
+    }
+
+    def _format_command_line(
+        self, command: str, command_meta: dict[str, Any], width: int
+    ) -> str:
+        """One entry of the `help` command list: summary, usage, aliases."""
+        if command in self._BUILTIN_HELP_KEYS:
+            help_text = self._t(self._BUILTIN_HELP_KEYS[command])
+        else:
+            help_text = command_meta.get("help") or self._t("help_no_description")
+            help_text = help_text.strip().splitlines()[0] if help_text.strip() else help_text
+        signature = self._format_command_signature(command_meta)
+        aliases = command_meta.get("aliases", [])
+        line = f"  {command:{width}} {help_text}"
+        if signature:
+            usage = self._t("help_list_usage")
+            line += f"\n    {'':{width}} {usage} {command} {signature}"
+        if aliases:
+            line += f" ({self._t('help_list_aliases')}: {', '.join(aliases)})"
+        return line
+
     def _format_command_signature(
         self, command_meta: dict[str, Any]
     ) -> str:
         parts: list[str] = []
         for arg in command_meta.get("arguments", []):
-            parts.append(
-                f"[{arg['name']}]" if arg.get("optional") else f"<{arg['name']}>"
-            )
+            nargs = arg.get("nargs")
+            if nargs == "+":
+                parts.append(f"<{arg['name']}...>")
+            elif nargs == "*":
+                parts.append(f"[{arg['name']}...]")
+            elif arg.get("optional"):
+                parts.append(f"[{arg['name']}]")
+            else:
+                parts.append(f"<{arg['name']}>")
         for opt in command_meta.get("options", []):
             if opt.get("is_flag"):
                 if opt.get("default") is True:
@@ -1011,7 +1077,7 @@ class CLI:
 
                 if matching_commands:
                     echo(
-                        f"Commands under '{cmd}':",
+                        self._t("help_commands_under", prefix=cmd),
                         "header",
                         formatter=self.output,
                     )
@@ -1019,20 +1085,10 @@ class CLI:
                     for command in sorted(matching_commands):
                         sub_meta = self.commands.get_command(command)
                         if sub_meta:
-                            help_text = sub_meta.get("help", "No description")
-                            signature = self._format_command_signature(sub_meta)
-                            aliases = sub_meta.get("aliases", [])
-                            line = f"  {command:30} {help_text}"
-                            if signature:
-                                line += (
-                                    f"\n    {'':30} Usage: {command} {signature}"
-                                )
-                            if aliases:
-                                line += f" (aliases: {', '.join(aliases)})"
-                            print(line)
+                            print(self._format_command_line(command, sub_meta, 30))
                     print("")
                     echo(
-                        "Use 'help <command>' for detailed help on a specific command.",
+                        self._t("help_detail_hint"),
                         "info",
                         formatter=self.output,
                     )
@@ -1075,35 +1131,33 @@ class CLI:
             for command in sorted(standalone):
                 cmd_meta = self.commands.get_command(command)
                 if cmd_meta:
-                    help_text = cmd_meta.get("help", "No description")
-                    signature = self._format_command_signature(cmd_meta)
-                    aliases = cmd_meta.get("aliases", [])
-                    line = f"  {command:20} {help_text}"
-                    if signature:
-                        line += f"\n    {'':20} Usage: {command} {signature}"
-                    if aliases:
-                        line += f" (aliases: {', '.join(aliases)})"
-                    print(line)
+                    print(self._format_command_line(command, cmd_meta, 20))
 
             if grouped:
                 print("")
-                echo("Command groups:", "header", formatter=self.output)
+                echo(
+                    self._t("help_command_groups"),
+                    "header",
+                    formatter=self.output,
+                )
                 for prefix in sorted(grouped):
                     cmds = grouped[prefix]
                     print(
-                        f"  {prefix:20} ({len(cmds)} commands) - "
-                        f"use 'help {prefix}' for details"
+                        f"  {prefix:20} "
+                        + self._t(
+                            "help_group_line", count=len(cmds), prefix=prefix
+                        )
                     )
             return 0
 
         self.commands.register(
             "help",
             help_command,
-            help="Show help information",
+            help=self._t("cmd_help"),
             arguments=[
                 {
                     "name": "cmd",
-                    "help": "Command to show help for",
+                    "help": self._t("cmd_help_arg"),
                     "type": str,
                     "optional": True,
                 }
@@ -1116,7 +1170,7 @@ class CLI:
             """Display application version."""
             version = self.config.get("version", "unknown")
             echo(
-                f"{self.name} version {version}",
+                self._t("cmd_version_line", name=self.name, version=version),
                 "info",
                 formatter=self.output,
             )
@@ -1125,7 +1179,7 @@ class CLI:
         self.commands.register(
             "version",
             version_command,
-            help="Show application version",
+            help=self._t("cmd_version"),
             arguments=[],
             options=[],
             is_async=False,
@@ -1141,7 +1195,7 @@ class CLI:
         self.commands.register(
             "exit",
             exit_command,
-            help="Exit the application",
+            help=self._t("cmd_exit"),
             arguments=[],
             options=[],
             aliases=["quit", "q"],
@@ -1163,8 +1217,11 @@ class CLI:
         type: Type[Any] = str,
         optional: bool = False,
         group: str | None = None,
+        nargs: str | None = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
-        return self._decorators.argument(name, help, type, optional, group)
+        return self._decorators.argument(
+            name, help, type, optional, group, nargs
+        )
 
     def option(
         self,
@@ -1337,9 +1394,10 @@ class CLI:
     def _auto_generate_command(
         self, name: str, func: Callable[..., Any]
     ) -> None:
-        from .decorators import _is_flag_param
+        from .decorators import _is_flag_param, resolve_param_types
 
         sig = _cached_signature(func)
+        hints = resolve_param_types(func)
         doc = inspect.getdoc(func) or f"Command {name}"
 
         arguments: list[dict[str, Any]] = []
@@ -1348,12 +1406,13 @@ class CLI:
         for param_name, param in sig.parameters.items():
             if param_name in ("self", "cls"):
                 continue
+            if param.kind in (
+                inspect.Parameter.VAR_POSITIONAL,
+                inspect.Parameter.VAR_KEYWORD,
+            ):
+                continue
 
-            param_type = (
-                param.annotation
-                if param.annotation is not inspect.Parameter.empty
-                else str
-            )
+            param_type = hints.get(param_name, str)
 
             if param.default is not inspect.Parameter.empty:
                 options.append(
@@ -1429,6 +1488,8 @@ class CLI:
         )
         self.messages = ConfigBasedMessageProvider(self.config)
         self.executor.messages = self.messages
+        if hasattr(self.parser, "set_message_provider"):
+            self.parser.set_message_provider(self.messages)
 
     async def run_interactive(self) -> int:
         if not self._commands_registered:

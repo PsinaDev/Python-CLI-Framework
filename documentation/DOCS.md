@@ -125,15 +125,29 @@ cli.argument(
     type: type = str,
     optional: bool = False,
     group: str | None = None,
+    nargs: str | None = None,      # None, "?", "*", "+"
 )
 ```
 
 Supported `type`: `str`, `int`, `float`, `bool`, `list`, `dict`, `tuple`,
-`Enum` subclasses, `Optional[T]`. `list` and `dict` accept either JSON or
-simple `key=value` / CSV syntax on the command line.
+`Enum` subclasses, `Optional[T]` / `T | None`. `list` and `dict` accept
+either JSON or simple `key=value` / CSV syntax on the command line.
 
 `optional=True` makes the positional argument optional; it must come last.
 `group` is a display-only label.
+
+`nargs` collects several values into a list: `"+"` — one or more, `"*"` —
+zero or more (empty → `[]`), `"?"` — same as `optional=True`. `type` is then
+the type of each **item**. Such an argument must also be the last and only
+open one:
+
+```python
+@cli.command()
+@cli.argument("modules", nargs="+")
+@cli.argument("version")
+def install(version: str, modules: list) -> int: ...
+# app install 6.10.3 multimedia serialport
+```
 
 ### `@cli.option`
 
@@ -152,6 +166,7 @@ cli.option(
 ```
 
 - `name` accepts `"--verbose"` or `"verbose"`; `short` accepts `"-v"` or `"v"` (single char).
+- A dash in the name maps to an underscore in the parameter: `--dry-run` → `dry_run`.
 - `is_flag` auto-resolves to `True` for `bool` types or `bool` defaults.
 - `default_factory` produces a fresh value each parse — use for `list`/`dict` defaults to avoid sharing.
 - `exclusive_group`: options sharing a label become mutually exclusive at the parser level.
@@ -298,6 +313,16 @@ interface:
 - `save()` — atomic write back to disk
 - `get_all()` — full snapshot
 
+### `MemoryConfigProvider`
+
+```python
+MemoryConfigProvider(default_config: dict[str, Any] | None = None)
+```
+
+Same hierarchical API, held in memory only: `save()` is a no-op and no file
+is created. Shortcut: `CLI(name, persist_config=False)` — without it, `CLI`
+creates `~/.config/<name>/<name>.json` by default.
+
 ### Hierarchical keys
 
 ```python
@@ -389,7 +414,31 @@ cli.messages.set_language("ru")
 ```
 
 Format placeholders use a safe formatter that ignores missing keys
-instead of raising. Errors: `MessageError`.
+instead of raising. Errors: `MessageError`. A missing key is logged as a
+warning only when no `default` was passed.
+
+### Framework strings
+
+Help output (`help`, `<command> --help`), built-in command descriptions
+and parse errors go through the same provider, using the keys in
+`cli.BUILTIN_MESSAGES` (English is the fallback). A Russian set ships as
+`BUILTIN_MESSAGES_RU`; turn it on with:
+
+```python
+cli = CLI(name="myapp", language="ru")
+```
+
+`language` installs the built-in strings for that language without
+overriding translations already in the config, then switches to it.
+Override any single string with `add_language`:
+
+```python
+cli.messages.add_language("ru", {"help_examples": "Как вызывать:"})
+```
+
+The argparse headings (`usage:`, `positional arguments`, `options`) are
+translated too: keys `help_usage`, `help_positionals`, `help_options`.
+Cached parsers are rebuilt automatically after a language switch.
 
 ---
 
@@ -624,8 +673,23 @@ CLI(
     auto_logging_middleware: bool = False,
     include_default_registry: bool = True,
     shell_posix: bool | None = None,
+    persist_config: bool = True,
+    language: str | None = None,
+    utf8_stdio: bool = True,
 )
 ```
+
+`persist_config=False` keeps the config in memory (`MemoryConfigProvider`);
+nothing is written to disk. An explicit `config_path` or `config_provider`
+takes precedence. `language` selects the message and help language (see
+"Framework strings"). `utf8_stdio`: on Windows, when stdout/stderr are
+redirected to a file or pipe, switch them to UTF-8 (otherwise Python writes
+in the ANSI code page and non-Latin text is garbled). The console itself is
+left alone.
+
+Type hints are read with `typing.get_type_hints`, so
+`from __future__ import annotations` in the module with your commands does
+not break flag and type detection.
 
 `shell_posix` controls how the interactive REPL splits input lines. `True`
 uses `shlex` POSIX mode (quotes are interpreted and stripped). `False` keeps
@@ -680,12 +744,14 @@ CommandMetadataRegistry, BoundDecorators, RESERVED_NAMES
 ConfigProvider, MessageProvider, OutputFormatter, CommandRegistry,
 ArgumentParser, CommandHandler, Middleware, Hook
 
-JsonConfigProvider, ConfigError, ConfigValidationError, ConfigIOError,
-ConfigLockError, sanitize_for_logging, EnvOverlayConfigProvider
+JsonConfigProvider, MemoryConfigProvider, ConfigError,
+ConfigValidationError, ConfigIOError, ConfigLockError,
+sanitize_for_logging, EnvOverlayConfigProvider
 
-ConfigBasedMessageProvider, MessageError
+ConfigBasedMessageProvider, MessageError, BUILTIN_MESSAGES,
+BUILTIN_MESSAGES_RU, BUILTIN_TRANSLATIONS
 
-TerminalOutputFormatter, echo, style, progress_bar, table
+TerminalOutputFormatter, configure_stdio, echo, style, progress_bar, table
 
 CommandRegistryImpl, EnhancedArgumentParser
 
@@ -703,7 +769,7 @@ __version__, get_version, get_version_tuple
 ### Colors not displaying
 
 Output is detected as non-TTY (piped or redirected). Force colors by
-passing a custom `TerminalOutputFormatter` with `force_color=True`, or
+passing a custom `TerminalOutputFormatter(use_colors=True)`, setting `FORCE_COLOR=1`, or
 emit ANSI manually via `style()`.
 
 ### Tab completion not working in the REPL

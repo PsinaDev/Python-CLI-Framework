@@ -53,6 +53,9 @@ def add(a: int, b: int) -> int: ...
 ## Features at a glance
 
 - Sync and async handlers
+- Variadic positional arguments (`nargs="+"` / `"*"`)
+- In-memory config with no files on disk (`CLI(..., persist_config=False)`)
+- Localizable help and built-in messages, Russian included (`CLI(..., language="ru")`)
 - Class-based command groups (`@cli.group` → dotted commands like `db.init`)
 - Middleware pipeline + global `Hook` interface + per-command `before` / `after` / `on_error_for`
 - `JsonConfigProvider` (file-locked, hierarchical keys, optional JSON-schema validation)

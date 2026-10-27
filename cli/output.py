@@ -171,6 +171,9 @@ def _supports_color() -> bool:
 
     plat = platform.system()
     if plat == "Windows":
+        # Redirected to a file or pipe: no escape codes in the output.
+        if not (hasattr(sys.stdout, "isatty") and sys.stdout.isatty()):
+            return False
         win_term = bool(
             os.environ.get("WT_SESSION")
             or os.environ.get("TERM_PROGRAM") == "vscode"
@@ -648,9 +651,29 @@ def table(
     formatter.render_table(headers, rows, max_col_width, file, output_format)
 
 
+def configure_stdio() -> None:
+    """On Windows, write UTF-8 when stdout/stderr go to a pipe or file.
+
+    The console itself already gets Unicode; a redirected stream falls back
+    to the ANSI code page (cp1251, cp1252, ...) and garbles non-Latin text.
+    """
+    if platform.system() != "Windows":
+        return
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            if stream is None or stream.isatty():
+                continue
+            encoding = (getattr(stream, "encoding", "") or "").lower()
+            if encoding.replace("-", "") != "utf8" and hasattr(stream, "reconfigure"):
+                stream.reconfigure(encoding="utf-8")
+        except (AttributeError, ValueError, OSError):
+            continue
+
+
 __all__ = [
     "OutputError",
     "TerminalOutputFormatter",
+    "configure_stdio",
     "echo",
     "style",
     "progress_bar",

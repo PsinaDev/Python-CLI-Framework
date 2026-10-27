@@ -109,8 +109,10 @@ class ConfigBasedMessageProvider(MessageProvider):
 
         if message is None:
             message = default if default is not None else key
+            # A caller-supplied default is an intentional fallback; only a
+            # key with nothing to fall back on is worth a warning.
             with self._state_lock:
-                if key not in self._warned_keys:
+                if default is None and key not in self._warned_keys:
                     self._warned_keys.add(key)
                     self._logger.warning(
                         f"Message '{key}' not found in any language; "
@@ -285,4 +287,118 @@ class ConfigBasedMessageProvider(MessageProvider):
             return str(value)
 
 
-__all__ = ["MessageError", "ConfigBasedMessageProvider"]
+BUILTIN_MESSAGES: dict[str, str] = {
+    # dispatch (prompt / welcome / app_quit carry the app name and live
+    # in the app config, see CLI._build_default_config)
+    "unknown_command": "Unknown command. Type 'help' for available commands.",
+    "available_commands": "Available commands:",
+    "command_not_found": "Command '{command}' not found.",
+    "execution_error": "Error executing command: {error}",
+    "did_you_mean": "Did you mean: {suggestions}?",
+    # command list (`help`)
+    "help_no_description": "No description",
+    "help_list_usage": "Usage:",
+    "help_list_aliases": "aliases",
+    "help_commands_under": "Commands under '{prefix}':",
+    "help_detail_hint": "Use 'help <command>' for detailed help on a specific command.",
+    "help_command_groups": "Command groups:",
+    "help_group_line": "({count} commands) - use 'help {prefix}' for details",
+    # per-command help
+    "help_usage": "usage: ",
+    "help_positionals": "positional arguments",
+    "help_options": "options",
+    "help_show_help": "Show this help message",
+    "help_flag_on": "{help} (enabled by default, use --no-{name} to disable)",
+    "help_flag_on_bare": "Disable {name} (enabled by default)",
+    "help_flag_off": "{help} (disabled by default)",
+    "help_flag_off_bare": "Enable {name}",
+    "help_value_for": "Value for {name} {examples}",
+    "help_choices": "{help} (choices: {values})",
+    "help_choices_bare": "Choices: {values}",
+    "help_notes": "Notes:",
+    "help_note_no_flags": "Flags marked as 'enabled by default' use --no-<name> to disable",
+    "help_type_conversion": "Type Conversion:",
+    "help_enum_options": "Enum Options:",
+    "help_examples": "Examples:",
+    "unknown_command_help": "Unknown command: {command}",
+    "invalid_arguments": (
+        "Invalid arguments for command '{command}': {error}.\n"
+        "Use '{command} --help' for detailed help."
+    ),
+    # built-in commands
+    "cmd_help": "Show help information",
+    "cmd_help_arg": "Command to show help for",
+    "cmd_version": "Show application version",
+    "cmd_version_line": "{name} version {version}",
+    "cmd_exit": "Exit the application",
+}
+
+BUILTIN_MESSAGES_RU: dict[str, str] = {
+    "unknown_command": "Неизвестная команда. Введите 'help', чтобы увидеть команды.",
+    "available_commands": "Команды:",
+    "command_not_found": "Команда '{command}' не найдена.",
+    "execution_error": "Ошибка выполнения команды: {error}",
+    "did_you_mean": "Возможно, вы имели в виду: {suggestions}?",
+    "help_no_description": "Без описания",
+    "help_list_usage": "Вызов:",
+    "help_list_aliases": "синонимы",
+    "help_commands_under": "Команды группы '{prefix}':",
+    "help_detail_hint": "Подробнее о команде: help <команда>.",
+    "help_command_groups": "Группы команд:",
+    "help_group_line": "(команд: {count}) — подробнее: help {prefix}",
+    "help_usage": "вызов: ",
+    "help_positionals": "аргументы",
+    "help_options": "опции",
+    "help_show_help": "Показать эту справку",
+    "help_flag_on": "{help} (включено по умолчанию, выключить: --no-{name})",
+    "help_flag_on_bare": "Выключить {name} (включено по умолчанию)",
+    "help_flag_off": "{help}",
+    "help_flag_off_bare": "Включить {name}",
+    "help_value_for": "Значение {name} {examples}",
+    "help_choices": "{help} (варианты: {values})",
+    "help_choices_bare": "Варианты: {values}",
+    "help_notes": "Примечания:",
+    "help_note_no_flags": "Флаги, включённые по умолчанию, выключаются через --no-<имя>",
+    "help_type_conversion": "Форматы значений:",
+    "help_enum_options": "Допустимые значения:",
+    "help_examples": "Примеры:",
+    "unknown_command_help": "Неизвестная команда: {command}",
+    "invalid_arguments": (
+        "Неверные аргументы команды '{command}': {error}.\n"
+        "Справка: {command} --help"
+    ),
+    "cmd_help": "Показать справку",
+    "cmd_help_arg": "Команда, по которой нужна справка",
+    "cmd_version": "Показать версию",
+    "cmd_version_line": "{name} версии {version}",
+    "cmd_exit": "Выйти",
+}
+
+BUILTIN_TRANSLATIONS: dict[str, dict[str, str]] = {
+    "en": BUILTIN_MESSAGES,
+    "ru": BUILTIN_MESSAGES_RU,
+}
+
+
+def builtin_message(
+    provider: MessageProvider | None, key: str, **kwargs: Any
+) -> str:
+    """Text of a framework string: the provider's translation if it has one,
+    else the built-in English default from ``BUILTIN_MESSAGES``."""
+    default = BUILTIN_MESSAGES[key]
+    if provider is not None:
+        return provider.get_message(key, default=default, **kwargs)
+    try:
+        return _safe_formatter.format(default, **kwargs)
+    except (KeyError, MessageError):
+        return default
+
+
+__all__ = [
+    "MessageError",
+    "ConfigBasedMessageProvider",
+    "BUILTIN_MESSAGES",
+    "BUILTIN_MESSAGES_RU",
+    "BUILTIN_TRANSLATIONS",
+    "builtin_message",
+]

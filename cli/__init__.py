@@ -34,6 +34,7 @@ from .config import (
     ConfigLockError,
     ConfigValidationError,
     JsonConfigProvider,
+    MemoryConfigProvider,
     sanitize_for_logging,
 )
 from .decorators import (
@@ -62,11 +63,15 @@ from .interfaces import (
     RESERVED_NAMES,
 )
 from .messages import (
+    BUILTIN_MESSAGES,
+    BUILTIN_MESSAGES_RU,
+    BUILTIN_TRANSLATIONS,
     ConfigBasedMessageProvider,
     MessageError,
 )
 from .output import (
     TerminalOutputFormatter,
+    configure_stdio,
     echo,
     progress_bar,
     style,
@@ -126,6 +131,7 @@ __all__ = [
     "Middleware",
     "Hook",
     "JsonConfigProvider",
+    "MemoryConfigProvider",
     "ConfigError",
     "ConfigValidationError",
     "ConfigIOError",
@@ -134,7 +140,11 @@ __all__ = [
     "EnvOverlayConfigProvider",
     "ConfigBasedMessageProvider",
     "MessageError",
+    "BUILTIN_MESSAGES",
+    "BUILTIN_MESSAGES_RU",
+    "BUILTIN_TRANSLATIONS",
     "TerminalOutputFormatter",
+    "configure_stdio",
     "echo",
     "style",
     "progress_bar",

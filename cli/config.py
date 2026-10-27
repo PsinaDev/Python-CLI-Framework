@@ -602,6 +602,63 @@ class JsonConfigProvider(ConfigProvider):
             raise ConfigIOError(f"Failed to save config: {exc}")
 
 
+class MemoryConfigProvider(ConfigProvider):
+    """In-memory configuration: same hierarchical API, nothing on disk.
+
+    ``save()`` is a no-op. Used by ``CLI(persist_config=False)`` for tools
+    that have no settings worth keeping between runs.
+    """
+
+    def __init__(self, default_config: dict[str, Any] | None = None) -> None:
+        self._config: dict[str, Any] = (
+            copy.deepcopy(default_config) if default_config else {}
+        )
+        self._mem_lock = threading.RLock()
+
+    def get(self, key: str, default: Any = None) -> Any:
+        with self._mem_lock:
+            node: Any = self._config
+            for part in key.split("."):
+                if not isinstance(node, dict) or part not in node:
+                    return default
+                node = node[part]
+            return copy.deepcopy(node) if isinstance(node, (dict, list)) else node
+
+    def set(self, key: str, value: Any) -> None:
+        with self._mem_lock:
+            parts = key.split(".")
+            node = self._config
+            for part in parts[:-1]:
+                if not isinstance(node.get(part), dict):
+                    node[part] = {}
+                node = node[part]
+            node[parts[-1]] = copy.deepcopy(value)
+
+    def delete(self, key: str) -> bool:
+        with self._mem_lock:
+            parts = key.split(".")
+            node: Any = self._config
+            for part in parts[:-1]:
+                if not isinstance(node, dict) or part not in node:
+                    return False
+                node = node[part]
+            if not isinstance(node, dict) or parts[-1] not in node:
+                return False
+            del node[parts[-1]]
+            return True
+
+    def save(self) -> None:
+        pass
+
+    def get_all(self) -> dict[str, Any]:
+        with self._mem_lock:
+            return copy.deepcopy(self._config)
+
+    def update(self, config: dict[str, Any]) -> None:
+        with self._mem_lock:
+            self._config = deep_merge(self._config, config)
+
+
 __all__ = [
     "ConfigError",
     "ConfigValidationError",
@@ -609,6 +666,7 @@ __all__ = [
     "ConfigLockError",
     "FileLock",
     "JsonConfigProvider",
+    "MemoryConfigProvider",
     "SENSITIVE_KEY_PATTERNS",
     "sanitize_for_logging",
     "deep_merge",
